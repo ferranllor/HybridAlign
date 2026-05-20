@@ -1,0 +1,6 @@
+exec
+perf.data
+perf.data.old
+bin/*
+datasets/*
+obj/*
