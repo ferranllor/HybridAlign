@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <omp.h>
 
 #include "include/my_time_lib.h"
 #include "include/cpu_sequential.h"
@@ -367,7 +368,7 @@ int main() {
         fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
     }
 
-    if (read_input_sequence("datasets/sequences/cactus-BRCA2-4500.fq", "datasets/sequences/cactus-BRCA2-4500.tsv", &sequence, &sequence_mod) != 0) { 
+    if (read_input_sequence("datasets/sequences/cactus-BRCA2-1500.fq", "datasets/sequences/cactus-BRCA2-1500.tsv", &sequence, &sequence_mod) != 0) { 
         fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
     }
 
