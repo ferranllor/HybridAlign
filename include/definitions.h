@@ -24,6 +24,11 @@
 
 typedef struct Node Node;
 typedef struct Graph Graph;
+typedef struct Sequence Sequence;
+
+typedef struct Sequence { 
+    DTYPEALPHABET* sequence; int size;
+} Sequence;
 
 typedef struct Node {
     int id;
@@ -31,10 +36,10 @@ typedef struct Node {
     Node** v_in; int num_in;
     Node** v_out; int num_out;
 
-    DTYPEALPHABET* sequence; int sequence_size;
+    Sequence sequence;
     DTYPEMATRIX* dp_matrix;
 
-    int max_score; int max_score_i; int max_score_j;
+    int max_score; int max_score_i; int max_score_j; int max_score_d;
 } Node;
 
 typedef struct Graph { 
@@ -43,13 +48,9 @@ typedef struct Graph {
     int max_score; int max_score_node_id;
 } Graph;
 
-typedef struct Sequence { 
-    char* sequence; int size;
-} Sequence;
-
 typedef struct {
-    char* graph_align;
-    char* query_align;
+    DTYPEALPHABET* graph_align;
+    DTYPEALPHABET* query_align;
 
     int size;
 } AlignmentResult;

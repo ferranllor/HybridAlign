@@ -6,6 +6,10 @@ static inline DTYPEMATRIX max(DTYPEMATRIX a, DTYPEMATRIX b) {
     return (a > b) ? a : b;
 }
 
+static inline DTYPEMATRIX min(DTYPEMATRIX a, DTYPEMATRIX b) {
+    return (a < b) ? a : b;
+}
+
 static inline int get_diag_start(int d, int M, int N) {
     int l_min = (M < N) ? M : N;
     int l_max = (M > N) ? M : N;
@@ -23,6 +27,15 @@ static inline int get_diag_start(int d, int M, int N) {
 static inline int get_diagonal_index(int i, int j, int M, int N) {
     int d = i + j;
     int start = get_diag_start(d, M, N);
-    int max_d_M = (0 > d - M) ? 0 : (d - M);
-    return start + j - max_d_M;
+    
+    int j_base = (d - M > 0) ? (d - M) : 0;
+    return start + (j - j_base);
+}
+
+static inline void reverse_string(char* str, int len) {
+    for (int i = 0; i < len / 2; i++) {
+        char temp = str[i];
+        str[i] = str[len - i - 1];
+        str[len - i - 1] = temp;
+    }
 }

@@ -10,22 +10,13 @@ AlignmentResult cpu_align_simd(Graph graph, Sequence sequence)
     {
         compute_dp_cpu_simd(&graph.nodes[n], sequence);
 
-        if (graph.nodes[n].max_score > graph.max_score) { // Update where to start traceback
+        if (graph.nodes[n].max_score > graph.max_score) { 
             graph.max_score = graph.nodes[n].max_score; 
             graph.max_score_node_id = n;
         }
     }
 
-    // Section 2: Traceback
     return compute_traceback_cpu_simd(graph, sequence);
-}
-
-void reverse_string(char* str, int len) {
-    for (int i = 0; i < len / 2; i++) {
-        char temp = str[i];
-        str[i] = str[len - i - 1];
-        str[len - i - 1] = temp;
-    }
 }
 
 
@@ -34,85 +25,49 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
     // ------------------------------------------------- Initialize -------------------------------------------------
 
     int M = sequence.size;
-    int N = node->sequence_size;
-
-    node->dp_matrix = (DTYPEMATRIX*)malloc((M + 1) * (N + 1) * sizeof(DTYPEMATRIX));
+    int N = node->sequence.size;
+    DTYPEMATRIX* __restrict dp = node->dp_matrix;
     
     if (node->num_in == 0) {
-        DTYPEMATRIX* curr_dp = node->dp_matrix;
-
-        // We initialize the boundary column (j = 0) for all rows (i)
-        for (int i = 0; i <= M; ++i) {
-            int act = get_diagonal_index(i, 0, M, N);
-            curr_dp[act] = 0;
-        }
-
-        for (int j = 1; j <= N; ++j) {
-            int act = get_diagonal_index(0, j, M, N);
-            curr_dp[act] = 0;
-        }
+        for (int i = 0; i <= M; ++i) dp[get_diagonal_index(i, 0, M, N)] = 0;
+        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
     }
     else if (node->num_in == 1) {
-        DTYPEMATRIX* curr_dp = node->dp_matrix;
         DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix;
-        int prev_N = node->v_in[0]->sequence_size;
+        int prev_N = node->v_in[0]->sequence.size;
 
         for (int i = 0; i <= M; ++i) {
-            int act = get_diagonal_index(i, 0, M, N);
-            // Inherit from the last column (j = prev_N) of the predecessor matrix
-            int offset = get_diagonal_index(i, prev_N, M, prev_N);
-            curr_dp[act] = prev_dp[offset];
+            dp[get_diagonal_index(i, 0, M, N)] = prev_dp[get_diagonal_index(i, prev_N, M, prev_N)];
         }
-
-        for (int j = 1; j <= N; ++j) {
-            int act = get_diagonal_index(0, j, M, N);
-            curr_dp[act] = 0;
-        }
+        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
     }
     else {
-        DTYPEMATRIX* curr_dp = node->dp_matrix;
         DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix; 
         DTYPEMATRIX* prev_dp2 = node->v_in[1]->dp_matrix; 
-
-        int prev_N1 = node->v_in[0]->sequence_size;
-        int prev_N2 = node->v_in[1]->sequence_size;
+        int prev_N1 = node->v_in[0]->sequence.size;
+        int prev_N2 = node->v_in[1]->sequence.size;
 
         for (int i = 0; i <= M; ++i) {
-            int act = get_diagonal_index(i, 0, M, N);
-            int offset = get_diagonal_index(i, prev_N1, M, prev_N1);
-            int offset2 = get_diagonal_index(i, prev_N2, M, prev_N2);
-            
-            curr_dp[act] = max(prev_dp[offset], prev_dp2[offset2]);
+            int score1 = prev_dp[get_diagonal_index(i, prev_N1, M, prev_N1)];
+            int score2 = prev_dp2[get_diagonal_index(i, prev_N2, M, prev_N2)];
+            dp[get_diagonal_index(i, 0, M, N)] = max(score1, score2);
         }
 
         for (int i = 2; i < node->num_in; ++i) {
             prev_dp = node->v_in[i]->dp_matrix;
-            int prev_Ni = node->v_in[i]->sequence_size;
-
+            int prev_Ni = node->v_in[i]->sequence.size;
             for (int j = 0; j <= M; ++j) {
                 int act = get_diagonal_index(j, 0, M, N);
-                int offset = get_diagonal_index(j, prev_Ni, M, prev_Ni);
-                
-                curr_dp[act] = max(prev_dp[offset], curr_dp[act]);
+                dp[act] = max(prev_dp[get_diagonal_index(j, prev_Ni, M, prev_Ni)], dp[act]);
             }
         }
-
-        for (int j = 1; j <= N; ++j) {
-            int act = get_diagonal_index(0, j, M, N);
-            curr_dp[act] = 0;
-        }
+        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
     }
 
     // ------------------------------------------------- Compute -------------------------------------------------
     
-    DTYPEMATRIX* __restrict dp = node->dp_matrix;
-    char* __restrict node_seq = node->sequence;
-    char* __restrict query_seq = malloc(sizeof(char) * sequence.size);
-
-    for (int i = 0; i < sequence.size; ++i)
-        query_seq[i] = sequence.sequence[i];
-
-    reverse_string(query_seq, sequence.size);
+    char* __restrict node_seq = node->sequence.sequence;
+    char* __restrict query_seq = sequence.sequence;
 
     int local_max = -1;
     int local_max_d = -1;
@@ -121,24 +76,258 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
     int l_min = (M < N) ? M : N;
     int l_max = (M > N) ? M : N;
 
-    int startCurr = get_diag_start(1, M, N);
-    int startPrev = get_diag_start(0, M, N);
+    int startCurr = 1;
+    int startPrev = 0;
+    int startPrevPrev;
+
+    int d = 2;
+
+    // --------------- Grow phase ------------------
+
+    for (; d <= l_min; ++d) {
+        startPrevPrev = startPrev;
+        startPrev = startCurr;
+        startCurr = startCurr + d;
+
+        int prev_max = local_max;
+        int d_size = d - 1;
+
+        for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+            int j = k - 1;
+            int i = d - k - 1;
+
+            int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+
+            int diagonal    = dp[startPrevPrev + k - 1] + score;
+            int up          = dp[startPrev + k] + GAP;
+            int left        = dp[startPrev + k - 1] + GAP;
+
+            int res = max(max(diagonal, 0), max(up, left));
+            dp[startCurr + k] = res;
+
+            if (res > local_max) {
+                local_max = res;
+            }
+        }
+
+        if (prev_max != local_max)
+        {
+            local_max_d = d;
+        }
+    }
+
+    // --------------- Stable phase ------------------
+
+    if (l_min == N) {
+        for (; d <= l_max; ++d) {
+            startPrevPrev = startPrev;
+            startPrev = startCurr;
+            startCurr = startCurr + N + 1;
+
+            int prev_max = local_max;
+            int d_size = N;
+
+            for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+                int j = k - 1;
+                int i = d - k - 1;
+
+                int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+
+                int diagonal    = dp[startPrevPrev + k - 1] + score;
+                int up          = dp[startPrev + k] + GAP;
+                int left        = dp[startPrev + k - 1] + GAP;
+
+                int res = max(max(diagonal, 0), max(up, left));
+                dp[startCurr + k] = res;
+
+                if (res > local_max) {
+                    local_max = res;
+                }
+            }
+
+            if (prev_max != local_max)
+            {
+                local_max_d = d;
+            }
+        }
+    }
+    else {
+        for (; d <= l_max; ++d) {
+            startPrevPrev = startPrev;
+            startPrev = startCurr;
+            startCurr = startCurr + M + 1;
+
+            int prev_max = local_max;
+            int d_size = M;
+
+            int off_curr = max(0, d - M);
+            int off_up   = max(0, d - 1 - M);
+            int off_diag = max(0, d - 2 - M);
+
+            for (int k = off_curr; k < off_curr + d_size; ++k) { 
+                int j = k - 1;
+                int i = d - k - 1;
+
+                int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+
+                int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
+                int up          = dp[startPrev + k - off_up] + GAP;
+                int left        = dp[startPrev + k - 1 - off_up] + GAP;
+
+                int res = max(max(diagonal, 0), max(up, left));
+                dp[startCurr + k - off_curr] = res;
+
+                if (res > local_max) {
+                    local_max = res;
+                }
+            }
+
+            if (prev_max != local_max)
+            {
+                local_max_d = d;
+            }
+        }
+    }
+
+    // --------------- Shrink phase ------------------
+
+    for (; d <= (M+N); ++d) {
+        startPrevPrev = startPrev;
+        startPrev = startCurr;
+        startCurr = startCurr + (M + N) - d + 2;
+
+        int prev_max = local_max;
+        int d_size = (M + N) - d + 1;
+
+        int off_curr = max(0, d - M);
+        int off_up   = max(0, d - 1 - M);
+        int off_diag = max(0, d - 2 - M);
+
+        for (int k = off_curr; k < off_curr + d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+            int j = k - 1;
+            int i = d - k - 1;
+
+            int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+
+            int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
+            int up          = dp[startPrev + k - off_up] + GAP;
+            int left        = dp[startPrev + k - 1 - off_up] + GAP;
+
+            int res = max(max(diagonal, 0), max(up, left));
+            dp[startCurr + k - off_curr] = res;
+
+            if (res > local_max) {
+                local_max = res;
+            }
+        }
+
+        if (prev_max != local_max)
+        {
+            local_max_d = d;
+        }
+    }
+
+    // ------------------ Find j of local max ------------------
+
+    if (local_max_d != -1) {
+        
+        int final_d = local_max_d;
+        int j_start = (local_max_d - M > 1) ? local_max_d - M : 1;
+        int j_end = (local_max_d - 1 < N) ? local_max_d - 1 : N;
+
+        startCurr = get_diag_start(final_d, M, N);
+
+        int off_curr = max(0, final_d - M); 
+
+        for (int j = j_start; j <= j_end; j++) {
+            if (dp[startCurr + j - off_curr] == local_max) {
+                local_max_j = j;
+                break;
+            }
+        }
+    }
+
+    node->max_score = local_max;
+    node->max_score_d = local_max_d;
+    node->max_score_i = (local_max_d != -1) ? (local_max_d - local_max_j) : -1;
+    node->max_score_j = local_max_j;
+}
+
+/*
+void compute_dp_cpu_simd(Node* node, Sequence sequence)
+{
+    // ------------------------------------------------- Initialize -------------------------------------------------
+
+    int M = sequence.size;
+    int N = node->sequence.size;
+    DTYPEMATRIX* __restrict dp = node->dp_matrix;
+    
+    if (node->num_in == 0) {
+        for (int i = 0; i <= M; ++i) dp[get_diagonal_index(i, 0, M, N)] = 0;
+        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
+    }
+    else if (node->num_in == 1) {
+        DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix;
+        int prev_N = node->v_in[0]->sequence.size;
+
+        for (int i = 0; i <= M; ++i) {
+            dp[get_diagonal_index(i, 0, M, N)] = prev_dp[get_diagonal_index(i, prev_N, M, prev_N)];
+        }
+        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
+    }
+    else {
+        DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix; 
+        DTYPEMATRIX* prev_dp2 = node->v_in[1]->dp_matrix; 
+        int prev_N1 = node->v_in[0]->sequence.size;
+        int prev_N2 = node->v_in[1]->sequence.size;
+
+        for (int i = 0; i <= M; ++i) {
+            int score1 = prev_dp[get_diagonal_index(i, prev_N1, M, prev_N1)];
+            int score2 = prev_dp2[get_diagonal_index(i, prev_N2, M, prev_N2)];
+            dp[get_diagonal_index(i, 0, M, N)] = max(score1, score2);
+        }
+
+        for (int i = 2; i < node->num_in; ++i) {
+            prev_dp = node->v_in[i]->dp_matrix;
+            int prev_Ni = node->v_in[i]->sequence.size;
+            for (int j = 0; j <= M; ++j) {
+                int act = get_diagonal_index(j, 0, M, N);
+                dp[act] = max(prev_dp[get_diagonal_index(j, prev_Ni, M, prev_Ni)], dp[act]);
+            }
+        }
+        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
+    }
+
+    // ------------------------------------------------- Compute -------------------------------------------------
+    
+    char* __restrict node_seq = node->sequence.sequence;
+    char* __restrict query_seq = sequence.sequence;
+
+    int local_max = -1;
+    int local_max_d = -1;
+    int local_max_j = -1;
+
+    int l_min = (M < N) ? M : N;
+    int l_max = (M > N) ? M : N;
+
+    int startCurr = 1;
+    int startPrev = 0;
     int startPrevPrev;
     int d = 2;
 
     // --------------- Grow phase ------------------
 
-    for (; d <= l_min; d++) {
-
+    for (; d < l_min; d++) {
+        
         startPrevPrev = startPrev;
         startPrev = startCurr;
-        startCurr = get_diag_start(d, M, N);
+        startCurr = startCurr + d;
 
         int prev_max = local_max;
         int j_start = 1;
-        int j_end = d - 1;
+        int j_end   = d - 1;
 
-        for (int j = 1; j < d; j++) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+        for (int j = j_start; j <= j_end; j++) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
             int i = d - j;
             int score = (node_seq[j-1] == query_seq[i-1]) ? MATCH : MISMATCH;
 
@@ -162,52 +351,88 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
 
     // ------------------ Stable phase ------------------
 
-    for (; d <= l_max; d++) {
-        
-        startPrevPrev = startPrev;
-        startPrev = startCurr;
-        startCurr = get_diag_start(d, M, N);
+    if (l_min == M)
+    {
+        for (; d < l_max; d++) {
 
-        int prev_max = local_max;
-        int j_start = (d - M > 1) ? d - M : 1;
-        int j_end = (d - 1 < N) ? d - 1 : N;
+            startPrevPrev = startPrev;
+            startPrev = startCurr;
+            startCurr = startCurr + l_min;
 
-        for (int j = j_start; j <= j_end; j++) {
-            int i = d - j;
-            int score = (node_seq[j-1] == query_seq[i-1]) ? MATCH : MISMATCH;
+            int prev_max = local_max;
+            int j_start = 0;
+            int j_end   = l_min - 1;
 
-            int diagonal    = dp[startPrevPrev + j - 1] + score;
-            int up          = dp[startPrev + j] + GAP;
-            int left        = dp[startPrev + j - 1] + GAP;
+            for (int j = j_start; j <= j_end; j++) { 
+                int i = d - j;
+                int score = (node_seq[j] == query_seq[i-1]) ? MATCH : MISMATCH;
 
-            int res = max(max(diagonal, 0), max(up, left));
-            dp[startCurr + j] = res;
+                int diagonal    = dp[startPrevPrev + j - 1] + score;
+                int up          = dp[startPrev + j] + GAP;
+                int left        = dp[startPrev + j - 1] + GAP;
 
-            if (res > local_max) {
-                local_max = res;
+                int res = max(max(diagonal, 0), max(up, left));
+                dp[startCurr + j] = res;
+
+                if (res > local_max) {
+                    local_max = res;
+                }
+            }
+
+            if (prev_max != local_max) {
+                local_max_d = d;
             }
         }
+    }
+    else {
+        for (; d < l_max; d++) {
 
-        if (prev_max != local_max) {
-            local_max_d = d;
+            startPrevPrev = startPrev;
+            startPrev = startCurr;
+            startCurr = startCurr + l_min;
+
+            int prev_max = local_max;
+            int j_start = 1;
+            int j_end   = l_min;
+
+            for (int j = j_start; j <= j_end; j++) { 
+                int i = d - j;
+                int score = (node_seq[j-1+d-l_min] == query_seq[l_min - j]) ? MATCH : MISMATCH;
+
+                int diagonal    = dp[startPrevPrev + j - 1] + score;
+                int up          = dp[startPrev + j] + GAP;
+                int left        = dp[startPrev + j - 1] + GAP;
+
+                int res = max(max(diagonal, 0), max(up, left));
+                dp[startCurr + j] = res;
+
+                if (res > local_max) {
+                    local_max = res;
+                }
+            }
+
+            if (prev_max != local_max) {
+                local_max_d = d;
+            }
         }
     }
 
     // ------------------ Shrink Phase ------------------
 
     int total_diagonals = M + N;
-    for (; d <= total_diagonals; d++) {
+
+    for (; d < total_diagonals - 2; d++) {
         startPrevPrev = startPrev;
         startPrev = startCurr;
-        startCurr = get_diag_start(d, M, N);
+        startCurr = startCurr + total_diagonals - d;
 
         int prev_max = local_max;
-        int j_start = (d - M > 1) ? d - M : 1;
-        int j_end = (d - 1 < N) ? d - 1 : N;
+        int j_start = 0;
+        int j_end   = total_diagonals - d;
 
-        for (int j = j_start; j <= j_end; j++) {
+        for (int j = j_start; j <= j_end; j++) { 
             int i = d - j;
-            int score = (node_seq[j-1] == query_seq[i-1]) ? MATCH : MISMATCH;
+            int score = (node_seq[j+N-j_end] == query_seq[i]) ? MATCH : MISMATCH;
 
             int diagonal    = dp[startPrevPrev + j - 1] + score;
             int up          = dp[startPrev + j] + GAP;
@@ -245,65 +470,81 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
     }
 
     node->max_score = local_max;
+    node->max_score_d = local_max_d;
     node->max_score_i = (local_max_d != -1) ? (local_max_d - local_max_j) : -1;
     node->max_score_j = local_max_j;
 }
+*/
 
 AlignmentResult compute_traceback_cpu_simd(Graph graph, Sequence sequence) {
-    // Start from the last node in the topological sort
     Node* curr_node = &graph.nodes[graph.max_score_node_id];
-    int i = curr_node->max_score_i;
-    int j = curr_node->max_score_j;
-    int row_width = sequence.size + 1;
+    int i = curr_node->max_score_i; 
+    int j = curr_node->max_score_j; 
+    int M = sequence.size;
 
-    char* align_graph = malloc(graph.num_nodes + sequence.size + 1);
-    char* align_query = malloc(graph.num_nodes + sequence.size + 1);
-    int pos = 0;
+    int max_graph_seq_len = 0;
+    for (int k = 0; k < graph.num_nodes; k++) {
+        max_graph_seq_len += graph.nodes[k].sequence.size;
+    }
+    char* align_graph = malloc(M + max_graph_seq_len + 1);
+    char* align_query = malloc(M + max_graph_seq_len + 1);
+    int pos = 0; 
 
     while (curr_node != NULL) {
-        int score_now = curr_node->dp_matrix[i * row_width + j];
-        if (score_now <= 0) break;
+        int N = curr_node->sequence.size;
+        int curr_score = curr_node->dp_matrix[get_diagonal_index(i, j, M, N)];
+        if (curr_score <= 0) break;
 
         if (i > 0 && j > 0) {
-            int score = (curr_node->sequence[i-1] == sequence.sequence[j-1]) ? MATCH : MISMATCH;
-            if (score_now == curr_node->dp_matrix[(i-1) * row_width + (j-1)] + score) {
-                align_graph[pos] = curr_node->sequence[i-1];
-                align_query[pos] = sequence.sequence[j-1];
+            int score = (curr_node->sequence.sequence[j-1] == sequence.sequence[i-1]) ? MATCH : MISMATCH;
+            
+            int diag_score = curr_node->dp_matrix[get_diagonal_index(i - 1, j - 1, M, N)];
+            int up_score   = curr_node->dp_matrix[get_diagonal_index(i - 1, j, M, N)];
+            int left_score = curr_node->dp_matrix[get_diagonal_index(i, j - 1, M, N)];
+
+            if (curr_score == diag_score + score) {
+                align_graph[pos] = curr_node->sequence.sequence[j-1];
+                align_query[pos] = sequence.sequence[i-1];
                 i--; j--;
-            } else if (score_now == curr_node->dp_matrix[(i-1) * row_width + j] + GAP) {
-                align_graph[pos] = curr_node->sequence[i-1];
-                align_query[pos] = '-';
+            } else if (curr_score == up_score + GAP) {
+                align_graph[pos] = '-';
+                align_query[pos] = sequence.sequence[i-1];
                 i--;
             } else {
-                align_graph[pos] = '-';
-                align_query[pos] = sequence.sequence[j-1];
+                align_graph[pos] = curr_node->sequence.sequence[j-1];
+                align_query[pos] = '-';
                 j--;
             }
             pos++;
-        } else if (i > 0) { // j == 0
-            align_graph[pos] = curr_node->sequence[i-1];
-            align_query[pos] = '-';
-            i--; pos++;
-        } else { // i == 0, jump to another node
+            
+        } else if (j == 0) { 
             if (curr_node->num_in > 0) {
                 Node* best_prev = NULL;
                 for (int p = 0; p < curr_node->num_in; p++) {
                     Node* prev = curr_node->v_in[p];
-                    if (score_now == prev->dp_matrix[prev->sequence_size * row_width + j]) {
+                    int prev_N = prev->sequence.size;
+                    if (curr_score == prev->dp_matrix[get_diagonal_index(i, prev_N, M, prev_N)]) {
                         best_prev = prev;
                         break;
                     }
                 }
                 curr_node = best_prev;
-                if (curr_node) i = curr_node->sequence_size;
+                if (curr_node) j = curr_node->sequence.size;
             } else {
-                while (j > 0) {
+                while (i > 0) {
                     align_graph[pos] = '-';
-                    align_query[pos] = sequence.sequence[j-1];
-                    j--; pos++;
+                    align_query[pos] = sequence.sequence[i-1];
+                    i--; pos++;
                 }
                 curr_node = NULL;
             }
+        } else if (i == 0) { 
+            while (j > 0) {
+                align_graph[pos] = curr_node->sequence.sequence[j-1];
+                align_query[pos] = '-';
+                j--; pos++;
+            }
+            curr_node = NULL;
         }
     }
     

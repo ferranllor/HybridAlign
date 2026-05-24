@@ -5,6 +5,7 @@
 
 #include "include/my_time_lib.h"
 #include "include/cpu_sequential.h"
+#include "include/cpu_simd.h"
 #include "include/definitions.h"
 
 // *************************************************************************************************
@@ -64,15 +65,15 @@ int read_gfa_graph(const char* filename, Graph* graph) {
                 id_map[current_node].index = current_node;
 
                 graph->nodes[current_node].id = current_node; 
-                graph->nodes[current_node].sequence_size = strlen(sequence);
+                graph->nodes[current_node].sequence.size = strlen(sequence);
                 
                 // If sequence is "*", it means sequence is omitted in GFA, handle appropriately
                 if (strcmp(sequence, "*") == 0) {
-                    graph->nodes[current_node].sequence_size = 0;
-                    graph->nodes[current_node].sequence = NULL;
+                    graph->nodes[current_node].sequence.size = 0;
+                    graph->nodes[current_node].sequence.sequence = NULL;
                 } else {
-                    graph->nodes[current_node].sequence = (char*)malloc((graph->nodes[current_node].sequence_size + 1) * sizeof(char));
-                    strcpy(graph->nodes[current_node].sequence, sequence);
+                    graph->nodes[current_node].sequence.sequence = (char*)malloc((graph->nodes[current_node].sequence.size + 1) * sizeof(char));
+                    strcpy(graph->nodes[current_node].sequence.sequence, sequence);
                 }
                 current_node++;
             }
@@ -127,6 +128,43 @@ static void strip_newline(char *str) {
         str[len - 1] = '\0';
         len--;
     }
+}
+
+int read_input_sequence_old(char* filename, Sequence* seq, Sequence* seq_mod)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Could not open file %s\n", filename);
+        return -1;
+    }
+
+    char line[4096];
+
+    if (fgets(line, sizeof(line), fp)) {
+        int id1, id2;
+        char s1[2048], s2[2048];
+
+        if (sscanf(line, "%d %d %s %s", &id1, &id2, s1, s2) == 4) {
+            
+            // Base sequence
+            seq->size = strlen(s1);
+            seq->sequence = (char*)malloc((seq->size + 1) * sizeof(char));
+            if (seq->sequence) {
+                strcpy(seq->sequence, s1);
+            }
+
+            // Ground truth
+            seq_mod->size = strlen(s2);
+            seq_mod->sequence = (char*)malloc((seq_mod->size + 1) * sizeof(char));
+            if (seq_mod->sequence) {
+                strcpy(seq_mod->sequence, s2);
+            }
+        }
+    }
+
+    fclose(fp);
+
+    return 0;
 }
 
 int read_input_sequence(char* fastqfile, char* truthfile, Sequence* seq, Sequence* seq_mod)
@@ -189,45 +227,6 @@ int read_input_sequence(char* fastqfile, char* truthfile, Sequence* seq, Sequenc
 
     return status;
 }
-
-/*
-int read_input_sequence_old(char* filename, Sequence* seq, Sequence* seq_mod)
-{
-    FILE *fp = fopen(filename, "r");
-    if (!fp) {
-        fprintf(stderr, "Error: Could not open file %s\n", filename);
-        return -1;
-    }
-
-    char line[4096];
-
-    if (fgets(line, sizeof(line), fp)) {
-        int id1, id2;
-        char s1[2048], s2[2048];
-
-        if (sscanf(line, "%d %d %s %s", &id1, &id2, s1, s2) == 4) {
-            
-            // Base sequence
-            seq->size = strlen(s1);
-            seq->sequence = (char*)malloc((seq->size + 1) * sizeof(char));
-            if (seq->sequence) {
-                strcpy(seq->sequence, s1);
-            }
-
-            // Ground truth
-            seq_mod->size = strlen(s2);
-            seq_mod->sequence = (char*)malloc((seq_mod->size + 1) * sizeof(char));
-            if (seq_mod->sequence) {
-                strcpy(seq_mod->sequence, s2);
-            }
-        }
-    }
-
-    fclose(fp);
-
-    return 0;
-}
-*/
 
 int sort_graph_topologically(Graph* graph) 
 {
@@ -335,19 +334,14 @@ void verify_alignment(const char* align_graph, const char* align_query, Sequence
     free(cleaned_query);
 }
 
-// *************************************************************************************************
-//
-//                                        Functionallity
-//
-// *************************************************************************************************
-
-// Sequential CPU
-
-// Parallel CPU
-
-Sequence cpu_align_parallel(Graph graph, Sequence sequence);
-void compute_dp_cpu_parallel(Node* node);
-
+void initGraph(Graph* graph, int seqSize)
+{
+    for (int n = 0; n < graph->num_nodes; n++) {
+        // Allocate with extra padding to safeguard the final diagonal tail offsets
+        size_t matrix_size = (seqSize + 2) * (graph->nodes[n].sequence.size + 2); 
+        graph->nodes[n].dp_matrix = (DTYPEMATRIX*)malloc(matrix_size * sizeof(DTYPEMATRIX));
+    }
+}
 
 // *************************************************************************************************
 //
@@ -358,29 +352,43 @@ void compute_dp_cpu_parallel(Node* node);
 int main() {
     Graph graph;
     Sequence sequence, sequence_mod;
-
-    if (read_gfa_graph("datasets/graphs/cactus-BRCA2.gfa", &graph) != 0) { 
+    
+    /*
+    if (read_gfa_graph("datasets/graphs/old/20_10.graph", &graph) != 0) { 
         fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
     }
-    /*
-    if (read_input_sequence("datasets/sequences/old/S_20_10.seq", &sequence, &sequence_mod) != 0) { 
+    
+    if (read_input_sequence_old("datasets/sequences/old/S_20_10.seq", &sequence, &sequence_mod) != 0) { 
         fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
     }
     */
+    
+    if (read_gfa_graph("datasets/graphs/cactus-BRCA2.gfa", &graph) != 0) { 
+        fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
+    }
+
     if (read_input_sequence("datasets/sequences/cactus-BRCA2.fq", "datasets/sequences/cactus-BRCA2.tsv", &sequence, &sequence_mod) != 0) { 
         fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
     }
+
     if (sort_graph_topologically(&graph) != 0) { 
         fprintf(stderr, "Error encountered while sorting input graph\n"); return -3; 
     }
 
+    printf("Successfully loaded input, proceeding with verification run.\n");
+
+    initGraph(&graph, sequence.size);
+
     // Verify
 
-    AlignmentResult res = cpu_align_sequential(graph, sequence);
+    AlignmentResult res = cpu_align_simd(graph, sequence);
     verify_alignment(res.graph_align, res.query_align, sequence_mod);
 
     printf("Graph Alignment: %s\n", res.graph_align);
     printf("Query Alignment: %s\n", res.query_align);
+
+    free(res.graph_align);
+    free(res.query_align);
 
     printf("Test passed. Prociding with timed executions\n");
 
@@ -393,8 +401,11 @@ int main() {
 
     
         TIMER_START(0);
-        AlignmentResult res = cpu_align_sequential(graph, sequence);
+        AlignmentResult res = cpu_align_simd(graph, sequence);
         TIMER_STOP(0);
+
+        free(res.graph_align);
+        free(res.query_align);
 
         double iter_time = TIMER_ELAPSED(0) / 1.e6;
         if( i >= 0) timers[i] = iter_time;
@@ -412,11 +423,8 @@ int main() {
     //double bandwidth_coo = bytes_coo / a_mean / 1.e9;
     //fprintf(stdout, "My GEMM-COO bandwidth %lf GB/s\n", bandwidth_coo);
 
-    free(res.graph_align);
-    free(res.query_align);
-    
     for (int i = 0; i < graph.num_nodes; i++) {
-        free(graph.nodes[i].sequence);
+        free(graph.nodes[i].sequence.sequence);
         if(graph.nodes[i].dp_matrix) free(graph.nodes[i].dp_matrix);
         if(graph.nodes[i].v_in) free(graph.nodes[i].v_in);
         if(graph.nodes[i].v_out) free(graph.nodes[i].v_out);
