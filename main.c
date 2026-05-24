@@ -367,7 +367,7 @@ int main() {
         fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
     }
 
-    if (read_input_sequence("datasets/sequences/cactus-BRCA2.fq", "datasets/sequences/cactus-BRCA2.tsv", &sequence, &sequence_mod) != 0) { 
+    if (read_input_sequence("datasets/sequences/cactus-BRCA2-4500.fq", "datasets/sequences/cactus-BRCA2-4500.tsv", &sequence, &sequence_mod) != 0) { 
         fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
     }
 
