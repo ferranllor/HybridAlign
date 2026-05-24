@@ -7,6 +7,7 @@
 #include "include/my_time_lib.h"
 #include "include/cpu_sequential.h"
 #include "include/cpu_simd.h"
+#include "include/cpu_simd_parallel_dp.h"
 #include "include/definitions.h"
 
 // *************************************************************************************************
@@ -382,7 +383,7 @@ int main() {
 
     // Verify
 
-    AlignmentResult res = cpu_align_simd(graph, sequence);
+    AlignmentResult res = cpu_align_simd_parallel_dp(graph, sequence);
     verify_alignment(res.graph_align, res.query_align, sequence_mod);
 
     printf("Graph Alignment: %s\n", res.graph_align);
@@ -402,7 +403,7 @@ int main() {
 
     
         TIMER_START(0);
-        AlignmentResult res = cpu_align_simd(graph, sequence);
+        AlignmentResult res = cpu_align_simd_parallel_dp(graph, sequence);
         TIMER_STOP(0);
 
         free(res.graph_align);
