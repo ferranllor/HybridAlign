@@ -4,3 +4,6 @@ perf.data.old
 bin/*
 datasets/*
 obj/*
+utils/*.gam
+utils/*.fq
+utils/*.tsv
