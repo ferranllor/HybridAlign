@@ -69,6 +69,11 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
     char* __restrict node_seq = node->sequence.sequence;
     char* __restrict query_seq = sequence.sequence;
 
+    char* __restrict query_seq_rev = (char*)malloc(M * sizeof(char));
+    for (int idx = 0; idx < M; ++idx) {
+        query_seq_rev[idx] = query_seq[M - 1 - idx];
+    }
+
     int local_max = -1;
     int local_max_d = -1;
     int local_max_j = -1;
@@ -94,9 +99,9 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
 
         for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
             int j = k - 1;
-            int i = d - k - 1;
+            int i = M - d + k;
 
-            int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
             int diagonal    = dp[startPrevPrev + k - 1] + score;
             int up          = dp[startPrev + k] + GAP;
@@ -129,9 +134,9 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
 
             for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
                 int j = k - 1;
-                int i = d - k - 1;
+                int i = M - d + k;
 
-                int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
                 int diagonal    = dp[startPrevPrev + k - 1] + score;
                 int up          = dp[startPrev + k] + GAP;
@@ -166,9 +171,9 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
 
             for (int k = off_curr; k < off_curr + d_size; ++k) { 
                 int j = k - 1;
-                int i = d - k - 1;
+                int i = M - d + k;
 
-                int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
                 int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
                 int up          = dp[startPrev + k - off_up] + GAP;
@@ -205,9 +210,9 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
 
         for (int k = off_curr; k < off_curr + d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
             int j = k - 1;
-            int i = d - k - 1;
+            int i = M - d + k;
 
-            int score = (node_seq[j] == query_seq[i]) ? MATCH : MISMATCH;
+            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
             int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
             int up          = dp[startPrev + k - off_up] + GAP;
@@ -226,6 +231,8 @@ void compute_dp_cpu_simd(Node* node, Sequence sequence)
             local_max_d = d;
         }
     }
+
+    free(query_seq_rev);
 
     // ------------------ Find j of local max ------------------
 
