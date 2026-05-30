@@ -7,3 +7,5 @@ obj/*
 utils/*.gam
 utils/*.fq
 utils/*.tsv
+tests
+utils/gensequence.sh

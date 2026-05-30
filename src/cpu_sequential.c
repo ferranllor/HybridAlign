@@ -110,8 +110,8 @@ AlignmentResult compute_traceback_cpu_sequential(Graph graph, Sequence sequence)
     int j = curr_node->max_score_j;
     int row_width = sequence.size + 1;
 
-    char* align_graph = malloc(graph.num_nodes + sequence.size + 1);
-    char* align_query = malloc(graph.num_nodes + sequence.size + 1);
+    char* align_graph = (char*)malloc(graph.num_nodes + sequence.size + 1);
+    char* align_query = (char*)malloc(graph.num_nodes + sequence.size + 1);
     int pos = 0;
 
     while (curr_node != NULL) {

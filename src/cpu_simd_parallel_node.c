@@ -1,26 +1,36 @@
-#include "../include/cpu_simd_parallel_dp.h"
+#include "../include/cpu_simd_parallel_node.h"
 
-AlignmentResult cpu_align_simd_parallel_dp(Graph graph, Sequence sequence)
+AlignmentResult cpu_align_simd_parallel_node(Graph graph, Sequence sequence)
 {
-    compute_dp_cpu_simd_parallel_dp(&graph.nodes[0], sequence);
+
+    #pragma omp parallel for num_threads(16)
+    for (int n = 0; n < graph.num_nodes; n++)
+    {
+        #pragma omp task depend(iterator(int i = 0:graph.nodes[n].num_in), in: *graph.nodes[n].v_in[i]) \
+                            depend(out: graph.nodes[n])
+        {
+            compute_dp_cpu_simd_parallel_node(&graph.nodes[n], sequence);
+            //printf("Node %d size: %dx%d\n", n, sequence.size, graph.nodes[n].sequence.size);
+        }
+    }
+
+    #pragma omp taskwait
+
     graph.max_score = graph.nodes[0].max_score;
     graph.max_score_node_id = 0;
-
     for (int n = 1; n < graph.num_nodes; n++)
     {
-        compute_dp_cpu_simd_parallel_dp(&graph.nodes[n], sequence);
-
         if (graph.nodes[n].max_score > graph.max_score) { 
             graph.max_score = graph.nodes[n].max_score; 
             graph.max_score_node_id = n;
         }
     }
 
-    return compute_traceback_cpu_simd_parallel_dp(graph, sequence);
+    return compute_traceback_cpu_simd_parallel_node(graph, sequence);
 }
 
 
-void compute_dp_cpu_simd_parallel_dp(Node* node, Sequence sequence)
+void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
 {
     // ------------------------------------------------- Initialize -------------------------------------------------
 
@@ -74,42 +84,68 @@ void compute_dp_cpu_simd_parallel_dp(Node* node, Sequence sequence)
         query_seq_rev[idx] = query_seq[M - 1 - idx];
     }
 
-    int n_threads = 2; // Even with 1 its 2x worse just because of openMP overhead :(
-
-    int* local_max_shared = (int*)malloc(sizeof(int) * n_threads);
-    int* local_max_d_shared = (int*)malloc(sizeof(int) * n_threads);
+    int local_max = -1;
+    int local_max_d = -1;
     int local_max_j = -1;
 
-    #pragma omp parallel num_threads(n_threads)
-    {
-        int t = omp_get_thread_num();
+    int l_min = (M < N) ? M : N;
+    int l_max = (M > N) ? M : N;
 
-        int local_max = -1;
-        int local_max_d = -1;
+    int startCurr = 1;
+    int startPrev = 0;
+    int startPrevPrev;
 
-        int l_min = (M < N) ? M : N;
-        int l_max = (M > N) ? M : N;
+    int d = 2;
 
-        int startCurr = 1;
-        int startPrev = 0;
-        int startPrevPrev;
+    // --------------- Grow phase ------------------
 
-        int d = 2;
+    for (; d <= l_min; ++d) {
+        startPrevPrev = startPrev;
+        startPrev = startCurr;
+        startCurr = startCurr + d;
 
-        // --------------- Grow phase ------------------
+        int prev_max = local_max;
+        int d_size = d - 1;
 
-        for (; d <= l_min; ++d) {
+        for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+            int j = k - 1;
+            int i = M - d + k;
+
+            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
+
+            int diagonal    = dp[startPrevPrev + k - 1] + score;
+            int up          = dp[startPrev + k] + GAP;
+            int left        = dp[startPrev + k - 1] + GAP;
+
+            int res = max(max(diagonal, 0), max(up, left));
+            dp[startCurr + k] = res;
+
+            if (res > local_max) {
+                local_max = res;
+            }
+        }
+
+        if (prev_max != local_max)
+        {
+            local_max_d = d;
+        }
+    }
+
+    // --------------- Stable phase ------------------
+
+    if (l_min == N) {
+        for (; d <= l_max; ++d) {
             startPrevPrev = startPrev;
             startPrev = startCurr;
-            startCurr = startCurr + d;
+            startCurr = startCurr + N + 1;
 
             int prev_max = local_max;
-            int d_size = d - 1;
+            int d_size = N;
 
-            #pragma omp for 
             for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
                 int j = k - 1;
                 int i = M - d + k;
+
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
                 int diagonal    = dp[startPrevPrev + k - 1] + score;
@@ -129,100 +165,21 @@ void compute_dp_cpu_simd_parallel_dp(Node* node, Sequence sequence)
                 local_max_d = d;
             }
         }
-
-        // --------------- Stable phase ------------------
-
-        if (l_min == N) {
-
-                for (; d <= l_max; ++d) {
-                    startPrevPrev = startPrev;
-                    startPrev = startCurr;
-                    startCurr = startCurr + N + 1;
-
-                    int prev_max = local_max;
-                    int d_size = N;
-
-                    #pragma omp for
-                    for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
-                        int j = k - 1;
-                        int i = M - d + k;
-
-                        int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                        int diagonal    = dp[startPrevPrev + k - 1] + score;
-                        int up          = dp[startPrev + k] + GAP;
-                        int left        = dp[startPrev + k - 1] + GAP;
-
-                        int res = max(max(diagonal, 0), max(up, left));
-                        dp[startCurr + k] = res;
-
-                        if (res > local_max) {
-                            local_max = res;
-                        }
-                    }
-
-                    if (prev_max != local_max)
-                    {
-                        local_max_d = d;
-                    }
-                }
-            
-        }
-        else {
-            for (; d <= l_max; ++d) {
-                startPrevPrev = startPrev;
-                startPrev = startCurr;
-                startCurr = startCurr + M + 1;
-
-                int prev_max = local_max;
-                int d_size = M;
-
-                int off_curr = max(0, d - M);
-                int off_up   = max(0, d - 1 - M);
-                int off_diag = max(0, d - 2 - M);
-
-                #pragma omp for
-                for (int k = off_curr; k < off_curr + d_size; ++k) { 
-                    int j = k - 1;
-                    int i = M - d + k;
-
-                    int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                    int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
-                    int up          = dp[startPrev + k - off_up] + GAP;
-                    int left        = dp[startPrev + k - 1 - off_up] + GAP;
-
-                    int res = max(max(diagonal, 0), max(up, left));
-                    dp[startCurr + k - off_curr] = res;
-
-                    if (res > local_max) {
-                        local_max = res;
-                    }
-                }
-
-                if (prev_max != local_max)
-                {
-                    local_max_d = d;
-                }
-            }
-        }
-
-        // --------------- Shrink phase ------------------
-
-        for (; d <= (M+N); ++d) {
+    }
+    else {
+        for (; d <= l_max; ++d) {
             startPrevPrev = startPrev;
             startPrev = startCurr;
-            startCurr = startCurr + (M + N) - d + 2;
+            startCurr = startCurr + M + 1;
 
             int prev_max = local_max;
-            int d_size = (M + N) - d + 1;
+            int d_size = M;
 
             int off_curr = max(0, d - M);
             int off_up   = max(0, d - 1 - M);
             int off_diag = max(0, d - 2 - M);
 
-            #pragma omp for
-            for (int k = off_curr; k < off_curr + d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+            for (int k = off_curr; k < off_curr + d_size; ++k) { 
                 int j = k - 1;
                 int i = M - d + k;
 
@@ -245,20 +202,43 @@ void compute_dp_cpu_simd_parallel_dp(Node* node, Sequence sequence)
                 local_max_d = d;
             }
         }
-
-        local_max_shared[t] = local_max;
-        local_max_d_shared[t] = local_max_d;
     }
 
-    int local_max = -1;
-    int local_max_d = -1;
+    // --------------- Shrink phase ------------------
 
-    for (int i = 0; i < n_threads; i++)
-    {
-        if (local_max_shared[i] > local_max)
+    for (; d <= (M+N); ++d) {
+        startPrevPrev = startPrev;
+        startPrev = startCurr;
+        startCurr = startCurr + (M + N) - d + 2;
+
+        int prev_max = local_max;
+        int d_size = (M + N) - d + 1;
+
+        int off_curr = max(0, d - M);
+        int off_up   = max(0, d - 1 - M);
+        int off_diag = max(0, d - 2 - M);
+
+        for (int k = off_curr; k < off_curr + d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+            int j = k - 1;
+            int i = M - d + k;
+
+            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
+
+            int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
+            int up          = dp[startPrev + k - off_up] + GAP;
+            int left        = dp[startPrev + k - 1 - off_up] + GAP;
+
+            int res = max(max(diagonal, 0), max(up, left));
+            dp[startCurr + k - off_curr] = res;
+
+            if (res > local_max) {
+                local_max = res;
+            }
+        }
+
+        if (prev_max != local_max)
         {
-            local_max = local_max_shared[i];
-            local_max_d = local_max_d_shared[i];
+            local_max_d = d;
         }
     }
 
@@ -272,7 +252,7 @@ void compute_dp_cpu_simd_parallel_dp(Node* node, Sequence sequence)
         int j_start = (local_max_d - M > 1) ? local_max_d - M : 1;
         int j_end = (local_max_d - 1 < N) ? local_max_d - 1 : N;
 
-        int startCurr = get_diag_start(final_d, M, N);
+        startCurr = get_diag_start(final_d, M, N);
 
         int off_curr = max(0, final_d - M); 
 
@@ -290,7 +270,7 @@ void compute_dp_cpu_simd_parallel_dp(Node* node, Sequence sequence)
     node->max_score_j = local_max_j;
 }
 
-AlignmentResult compute_traceback_cpu_simd_parallel_dp(Graph graph, Sequence sequence) {
+AlignmentResult compute_traceback_cpu_simd_parallel_node(Graph graph, Sequence sequence) {
     Node* curr_node = &graph.nodes[graph.max_score_node_id];
     int i = curr_node->max_score_i; 
     int j = curr_node->max_score_j; 

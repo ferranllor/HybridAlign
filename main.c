@@ -8,6 +8,7 @@
 #include "include/cpu_sequential.h"
 #include "include/cpu_simd.h"
 #include "include/cpu_simd_parallel_dp.h"
+#include "include/cpu_simd_parallel_node.h"
 #include "include/definitions.h"
 
 // *************************************************************************************************
@@ -140,11 +141,11 @@ int read_input_sequence_old(char* filename, Sequence* seq, Sequence* seq_mod)
         return -1;
     }
 
-    char line[4096];
+    char line[16384];
 
     if (fgets(line, sizeof(line), fp)) {
         int id1, id2;
-        char s1[2048], s2[2048];
+        char s1[16384], s2[16384];
 
         if (sscanf(line, "%d %d %s %s", &id1, &id2, s1, s2) == 4) {
             
@@ -355,27 +356,27 @@ int main() {
     Graph graph;
     Sequence sequence, sequence_mod;
     
-    /*
-    if (read_gfa_graph("datasets/graphs/old/20_10.graph", &graph) != 0) { 
+    if (read_gfa_graph("datasets/graphs/old/500_10.graph", &graph) != 0) { 
         fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
     }
     
-    if (read_input_sequence_old("datasets/sequences/old/S_20_10.seq", &sequence, &sequence_mod) != 0) { 
+    if (read_input_sequence_old("datasets/sequences/old/S_500_10.seq", &sequence, &sequence_mod) != 0) { 
         fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
     }
-    */
     
-    if (read_gfa_graph("datasets/graphs/cactus-BRCA2.gfa", &graph) != 0) { 
+    /*
+    if (read_gfa_graph("datasets/graphs/mhc_slice.gfa", &graph) != 0) { 
         fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
     }
 
-    if (read_input_sequence("datasets/sequences/cactus-BRCA2-1500.fq", "datasets/sequences/cactus-BRCA2-1500.tsv", &sequence, &sequence_mod) != 0) { 
+    if (read_input_sequence("datasets/sequences/mhc_slice-1000.fq", "datasets/sequences/mhc_slice-1000.tsv", &sequence, &sequence_mod) != 0) { 
         fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
     }
 
     if (sort_graph_topologically(&graph) != 0) { 
         fprintf(stderr, "Error encountered while sorting input graph\n"); return -3; 
     }
+    */
 
     printf("Successfully loaded input, proceeding with verification run.\n");
 
@@ -383,18 +384,18 @@ int main() {
 
     // Verify
 
-    AlignmentResult res = cpu_align_simd_parallel_dp(graph, sequence);
+    AlignmentResult res = cpu_align_simd_parallel_node(graph, sequence);
     verify_alignment(res.graph_align, res.query_align, sequence_mod);
 
-    printf("Graph Alignment: %s\n", res.graph_align);
-    printf("Query Alignment: %s\n", res.query_align);
+    //printf("Graph Alignment: %s\n", res.graph_align);
+    //printf("Query Alignment: %s\n", res.query_align);
 
     free(res.graph_align);
     free(res.query_align);
 
     printf("Test passed. Prociding with timed executions\n");
 
-    // Time executions
+    // Timed executions
 
     double timers[NITER];
     TIMER_DEF(0);
@@ -403,7 +404,7 @@ int main() {
 
     
         TIMER_START(0);
-        AlignmentResult res = cpu_align_simd_parallel_dp(graph, sequence);
+        AlignmentResult res = cpu_align_simd_parallel_node(graph, sequence);
         TIMER_STOP(0);
 
         free(res.graph_align);
@@ -412,7 +413,7 @@ int main() {
         double iter_time = TIMER_ELAPSED(0) / 1.e6;
         if( i >= 0) timers[i] = iter_time;
 
-        printf("Iteration %d tooks %lfs\n", i, iter_time);
+        printf("Iteration %d took %lfs\n", i, iter_time);
     }
 
     double a_mean = arithmetic_mean(timers, NITER);

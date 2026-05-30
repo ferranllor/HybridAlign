@@ -15,7 +15,7 @@ MAIN_NAME=main
 MAIN_BIN=$(MAIN_NAME)
 MAIN_SRC=$(MAIN_NAME).c
 
-OBJECTS = $(OBJ_FOLDER)/my_time_lib.o $(OBJ_FOLDER)/cpu_sequential.o $(OBJ_FOLDER)/cpu_simd.o $(OBJ_FOLDER)/cpu_simd_parallel_dp.o
+OBJECTS = $(OBJ_FOLDER)/my_time_lib.o $(OBJ_FOLDER)/cpu_sequential.o $(OBJ_FOLDER)/cpu_simd.o $(OBJ_FOLDER)/cpu_simd_parallel_dp.o $(OBJ_FOLDER)/cpu_simd_parallel_node.o
 
 all: $(BIN_FOLDER)/$(MAIN_BIN)
 
@@ -34,6 +34,10 @@ $(OBJ_FOLDER)/cpu_simd.o: $(SRC_FOLDER)/cpu_simd.c
 $(OBJ_FOLDER)/cpu_simd_parallel_dp.o: $(SRC_FOLDER)/cpu_simd_parallel_dp.c
 	@mkdir -p $(BIN_FOLDER) $(OBJ_FOLDER) $(BATCH_OUT_FOLDER)
 	$(CC) -c $(SRC_FOLDER)/cpu_simd_parallel_dp.c -o $@ $(LIB_FLAGS) $(INCLUDES)
+
+$(OBJ_FOLDER)/cpu_simd_parallel_node.o: $(SRC_FOLDER)/cpu_simd_parallel_node.c
+	@mkdir -p $(BIN_FOLDER) $(OBJ_FOLDER) $(BATCH_OUT_FOLDER)
+	$(CC) -c $(SRC_FOLDER)/cpu_simd_parallel_node.c -o $@ $(LIB_FLAGS) $(INCLUDES)
 
 $(BIN_FOLDER)/$(MAIN_BIN): $(MAIN_SRC) $(OBJECTS)
 	mkdir -p $(BIN_FOLDER)
