@@ -9,3 +9,5 @@ utils/*.fq
 utils/*.tsv
 tests
 utils/gensequence.sh
+*.nsys-rep
+.vscode/c_cpp_properties.json

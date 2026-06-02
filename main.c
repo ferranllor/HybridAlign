@@ -3,13 +3,19 @@
 #include <math.h>
 #include <string.h>
 #include <omp.h>
+#include <stdbool.h>
 
 #include "include/my_time_lib.h"
+#include "include/commons.cuh"
+#include "include/definitions.h"
+
 #include "include/cpu_sequential.h"
 #include "include/cpu_simd.h"
 #include "include/cpu_simd_parallel_dp.h"
 #include "include/cpu_simd_parallel_node.h"
-#include "include/definitions.h"
+
+#include "include/cuda_naive.cuh"
+
 
 // *************************************************************************************************
 //
@@ -238,6 +244,8 @@ int sort_graph_topologically(Graph* graph)
     int* order = (int*)malloc(graph->num_nodes * sizeof(int));
     int* temp_indegree = (int*)malloc(graph->num_nodes * sizeof(int));
     int* queue = (int*)malloc(graph->num_nodes * sizeof(int));
+    int* depth = (int*)calloc(graph->num_nodes, sizeof(int));
+
     int head = 0, tail = 0;
 
     for (int i = 0; i < graph->num_nodes; i++) {
@@ -252,6 +260,11 @@ int sort_graph_topologically(Graph* graph)
         Node* u = &graph->nodes[u_idx];
         for (int i = 0; i < u->num_out; i++) {
             int v_idx = u->v_out[i]->id; 
+
+            if (depth[u_idx] + 1 > depth[v_idx]) {
+                depth[v_idx] = depth[u_idx] + 1;
+            }
+
             if (--temp_indegree[v_idx] == 0) queue[tail++] = v_idx;
         }
     }
@@ -271,6 +284,8 @@ int sort_graph_topologically(Graph* graph)
         int old_idx = order[i];
         sorted_nodes[i] = graph->nodes[old_idx];
         sorted_nodes[i].id = i; // Update ID to match new index
+        
+        sorted_nodes[i].depth = depth[old_idx];
     }
 
     for (int i = 0; i < graph->num_nodes; i++) {
@@ -298,6 +313,7 @@ int sort_graph_topologically(Graph* graph)
     free(temp_indegree);
     free(queue);
     free(old_to_new);
+    free(depth);
 
     return 0;
 }
@@ -337,33 +353,32 @@ void verify_alignment(const char* align_graph, const char* align_query, Sequence
     free(cleaned_query);
 }
 
-void initGraph(Graph* graph, int seqSize)
-{
-    for (int n = 0; n < graph->num_nodes; n++) {
-        // Allocate with extra padding to safeguard the final diagonal tail offsets
-        size_t matrix_size = (seqSize + 2) * (graph->nodes[n].sequence.size + 2); 
-        graph->nodes[n].dp_matrix = (DTYPEMATRIX*)malloc(matrix_size * sizeof(DTYPEMATRIX));
-    }
-}
-
 // *************************************************************************************************
 //
 //                                             Main
 //
 // *************************************************************************************************
 
-int main() {
-    Graph graph;
+int main(int argc, char *argv[]) {
+    Graph graph, cudaGraph;
     Sequence sequence, sequence_mod;
-    
-    if (read_gfa_graph("datasets/graphs/old/500_10.graph", &graph) != 0) { 
-        fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
+
+    if (argc < 4)
+    {
+        fprintf(stderr, "Too few number of arguments! Format is %s [0-2] [0-n]\n", (char*)argv[0]);
+        fprintf(stderr, " --- First argument: --- \n");
+        fprintf(stderr, "String: name of the file pair in datasets/old to be used for input/sequence (Ex. 500_10)\n");
+        fprintf(stderr, " --- Second argument: --- \n");
+        fprintf(stderr, "0 = CPU-only\n"); 
+        fprintf(stderr, "1 = GPU-only\n"); 
+        fprintf(stderr, "2 = CPU-GPU exec\n"); 
+        fprintf(stderr, " --- Third argument: --- \n"); 
+        fprintf(stderr, "0: 0-3 For CPU-only\n"); 
+        fprintf(stderr, "1: 0-1 For GPU-only\n"); 
+        fprintf(stderr, "2: WIP\n"); 
+        return -1; 
     }
-    
-    if (read_input_sequence_old("datasets/sequences/old/S_500_10.seq", &sequence, &sequence_mod) != 0) { 
-        fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
-    }
-    
+
     /*
     if (read_gfa_graph("datasets/graphs/mhc_slice.gfa", &graph) != 0) { 
         fprintf(stderr, "Error encountered while reading input graph\n"); return -1; 
@@ -372,19 +387,69 @@ int main() {
     if (read_input_sequence("datasets/sequences/mhc_slice-1000.fq", "datasets/sequences/mhc_slice-1000.tsv", &sequence, &sequence_mod) != 0) { 
         fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
     }
+    */
+
+    char graph_path[1000];
+    char sequence_path[1000];
+
+    // Safe path formatting using snprintf
+    snprintf(graph_path, sizeof(graph_path), "datasets/graphs/old/%s.graph", argv[1]);
+    snprintf(sequence_path, sizeof(sequence_path), "datasets/sequences/old/S_%s.seq", argv[1]);
+
+    if (read_gfa_graph(graph_path, &graph) != 0) { 
+        fprintf(stderr, "Error encountered while reading input graph\n"); return -2; 
+    }
+    
+    if (read_input_sequence_old(sequence_path, &sequence, &sequence_mod) != 0) { 
+        fprintf(stderr, "Error encountered while reading input sequence\n"); return -2; 
+    }
 
     if (sort_graph_topologically(&graph) != 0) { 
         fprintf(stderr, "Error encountered while sorting input graph\n"); return -3; 
     }
-    */
 
     printf("Successfully loaded input, proceeding with verification run.\n");
 
-    initGraph(&graph, sequence.size);
+    int mode = atoi(argv[2]);
+    int version = atoi(argv[3]);
+
+    bool CPU = (mode == 0);
+    bool GPU = (mode == 1);
+    bool Hybrid = (mode == 2);
+
+    if (CPU) {
+        init_cpu_graph(&graph, sequence.size);
+    }
+    else if (GPU) {
+        init_cpu_graph(&graph, sequence.size);
+        init_gpu_graph(&graph, &cudaGraph, sequence.size);
+    }
+    else {
+        fprintf(stderr, "Still not implemented!\n"); return -4;
+    }
 
     // Verify
 
-    AlignmentResult res = cpu_align_simd_parallel_node(graph, sequence);
+    AlignmentResult res;
+
+    if (CPU)
+    {
+        switch (version){
+            case 0: res = cpu_align_sequential(graph, sequence); break;
+            case 1: res = cpu_align_simd(graph, sequence); break;
+            case 2: res = cpu_align_simd_parallel_dp(graph, sequence); break;
+            case 3: res = cpu_align_simd_parallel_node(graph, sequence); break;
+            default: fprintf(stderr, "Unspecified CPU version!\n"); return -4;
+        }
+    }
+    else if (GPU)
+    {
+        switch (version){
+            case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
+            default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
+        }
+    }
+        
     verify_alignment(res.graph_align, res.query_align, sequence_mod);
 
     //printf("Graph Alignment: %s\n", res.graph_align);
@@ -401,10 +466,25 @@ int main() {
     TIMER_DEF(0);
     
     for (int i=-WARMUP; i<NITER; i++) {
-
     
         TIMER_START(0);
-        AlignmentResult res = cpu_align_simd_parallel_node(graph, sequence);
+        if (CPU)
+        {
+            switch (version){
+                case 0: res = cpu_align_sequential(graph, sequence); break;
+                case 1: res = cpu_align_simd(graph, sequence); break;
+                case 2: res = cpu_align_simd_parallel_dp(graph, sequence); break;
+                case 3: res = cpu_align_simd_parallel_node(graph, sequence); break;
+                default: fprintf(stderr, "Unspecified CPU version!\n"); return -4;
+            }
+        }
+        else if (GPU)
+        {
+            switch (version){
+                case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
+                default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
+            }
+        }
         TIMER_STOP(0);
 
         free(res.graph_align);
@@ -419,20 +499,23 @@ int main() {
     double a_mean = arithmetic_mean(timers, NITER);
     fprintf(stdout, "Arithmetic Mean: %lf\n", a_mean);
 
-
     //Maybe calculate bandwith? Idk, might be useful... or not.
 
     //double bytes_cpu_sequential = nnz * (sizeof(float) + sizeof(int) + sizeof(int) + sizeof(float));
     //double bandwidth_coo = bytes_coo / a_mean / 1.e9;
     //fprintf(stdout, "My GEMM-COO bandwidth %lf GB/s\n", bandwidth_coo);
 
-    for (int i = 0; i < graph.num_nodes; i++) {
-        free(graph.nodes[i].sequence.sequence);
-        if(graph.nodes[i].dp_matrix) free(graph.nodes[i].dp_matrix);
-        if(graph.nodes[i].v_in) free(graph.nodes[i].v_in);
-        if(graph.nodes[i].v_out) free(graph.nodes[i].v_out);
+    if (CPU) {
+        free_cpu_graph(&graph);
     }
-    free(graph.nodes);
+    else if (GPU) {
+        free_cpu_graph(&graph);
+        free_gpu_graph(&cudaGraph);
+    }
+    else {
+        fprintf(stderr, "Still not implemented!\n"); return -4;
+    }
+
     free(sequence.sequence);
     free(sequence_mod.sequence);
     

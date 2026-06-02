@@ -8,7 +8,6 @@
 
 #define DTYPEALPHABET char
 #define DTYPEMATRIX int
-#define INT_MIN 2147483647/2
 
 #define WARMUP 2
 #define NITER 10
@@ -32,7 +31,7 @@ typedef struct Sequence {
 } Sequence;
 
 typedef struct Node {
-    int id;
+    int id, depth;
 
     Node** v_in; int num_in;
     Node** v_out; int num_out;

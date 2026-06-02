@@ -1,4 +1,5 @@
 #include "../include/cpu_simd.h"
+#include "../include/cpu_utils.h"
 
 AlignmentResult cpu_align_simd(Graph graph, Sequence sequence)
 {

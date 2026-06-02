@@ -1,4 +1,5 @@
 #include "../include/cpu_simd_parallel_dp.h"
+#include "../include/cpu_utils.h"
 
 AlignmentResult cpu_align_simd_parallel_dp(Graph graph, Sequence sequence)
 {

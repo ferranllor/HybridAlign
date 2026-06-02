@@ -1,4 +1,5 @@
 #include "../include/cpu_sequential.h"
+#include "../include/cpu_utils.h"
 
 AlignmentResult cpu_align_sequential(Graph graph, Sequence sequence)
 {
