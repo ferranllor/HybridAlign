@@ -11,3 +11,4 @@ tests
 utils/gensequence.sh
 *.nsys-rep
 .vscode/*
+
