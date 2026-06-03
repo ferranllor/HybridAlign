@@ -15,7 +15,7 @@
 #include "include/cpu_simd_parallel_node.h"
 
 #include "include/cuda_naive.cuh"
-
+#include "include/cuda_parallel_node.cuh"
 
 // *************************************************************************************************
 //
@@ -421,7 +421,13 @@ int main(int argc, char *argv[]) {
         init_cpu_graph(&graph, sequence.size);
     }
     else if (GPU) {
-        init_cpu_graph(&graph, sequence.size);
+        switch (version){
+            case 0: init_cpu_graph(&graph, sequence.size); break;
+            case 1: init_cpu_graph_pinned(&graph, sequence.size); break;
+            case 2: init_cpu_graph_pinned(&graph, sequence.size); break;
+            default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
+        }
+        
         init_gpu_graph(&graph, &cudaGraph, sequence.size);
     }
     else {
@@ -446,6 +452,8 @@ int main(int argc, char *argv[]) {
     {
         switch (version){
             case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
+            case 1: res = gpu_align_naive(graph, cudaGraph, sequence); break;
+            case 2: res = gpu_align_parallel_node(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
     }
@@ -482,6 +490,8 @@ int main(int argc, char *argv[]) {
         {
             switch (version){
                 case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
+                case 1: res = gpu_align_naive(graph, cudaGraph, sequence); break;
+                case 2: res = gpu_align_parallel_node(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }
@@ -509,7 +519,13 @@ int main(int argc, char *argv[]) {
         free_cpu_graph(&graph);
     }
     else if (GPU) {
-        free_cpu_graph(&graph);
+        switch (version){
+            case 0: free_cpu_graph(&graph); break;
+            case 1: free_cpu_graph_pinned(&graph); break;
+            case 2: free_cpu_graph_pinned(&graph); break;
+            default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
+        }
+        
         free_gpu_graph(&cudaGraph);
     }
     else {

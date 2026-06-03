@@ -1,8 +1,21 @@
-#include "../include/cpu_simd_parallel_node.h"
-#include "../include/cpu_utils.h"
+#include "../include/cuda_parallel_node.cuh"
 
-AlignmentResult cpu_align_simd_parallel_node(Graph graph, Sequence sequence)
+AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence sequence)
 {
+    Sequence sequence_rev;
+    Sequence tmp;
+
+    tmp.sequence = (char*)malloc(sequence.size * sizeof(char));
+    for (int idx = 0; idx < sequence.size; ++idx) {
+        tmp.sequence[idx] = sequence.sequence[sequence.size - 1 - idx];
+    }
+
+    sequence_rev.size = sequence.size;
+
+    cudaMalloc((void**)&sequence_rev.sequence, sequence.size * sizeof(char));
+    cudaMemcpy(sequence_rev.sequence, tmp.sequence, sequence.size * sizeof(char), cudaMemcpyHostToDevice);
+
+
     int num_levels = graph.nodes[graph.num_nodes-1].depth + 1;
     int* nodes_per_level = (int*)calloc(num_levels, sizeof(int));
 
@@ -11,21 +24,46 @@ AlignmentResult cpu_align_simd_parallel_node(Graph graph, Sequence sequence)
         nodes_per_level[depth]++;
     }
 
-    #pragma omp parallel num_threads(16)
-    {
-        Node* act = graph.nodes;
-        for (int l = 0; l < num_levels; l++)
-        {
-            #pragma omp for schedule(dynamic)
-            for(int t = 0; t < nodes_per_level[l]; t++)
-            {
-                compute_dp_cpu_simd_parallel_node(&act[t], sequence);
-                //printf("Node %d size: %dx%d\n", n, sequence.size, graph.nodes[n].sequence.size);
-            }
+    cudaError_t status;
+    Node* act = cudaGraph.nodes;
 
-            act = &act[nodes_per_level[l]];
+    for (int d = 0; d < num_levels; d++)
+    {
+        dim3 gridDim(nodes_per_level[d]);
+        dim3 blockDim(BLOCKSIZE);
+
+        compute_dp_gpu_parallel_node<<<gridDim, blockDim>>>(act, sequence, sequence_rev);
+        
+        cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
         }
+
+        status = cudaDeviceSynchronize();
+        if (status != cudaSuccess) {
+            fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
+        }
+
+        act = &act[nodes_per_level[d]];
     }
+
+    /*
+    int mean_nodes_per_level = 0;
+
+    for (int d = 0; d < num_levels; d++) {
+        mean_nodes_per_level += nodes_per_level[d];
+    }
+
+    printf("Mean nodes per level: %f\n", (double)mean_nodes_per_level/(double)num_levels);
+    printf("Num nodes: %d\n", graph.num_nodes);
+
+    printf("Num nodes level 2: %d\n", nodes_per_level[2]);
+    printf("Num nodes level 4: %d\n", nodes_per_level[4]);
+    printf("Num nodes level 8: %d\n", nodes_per_level[8]);
+    printf("Num nodes level 16: %d\n", nodes_per_level[16]);
+    printf("Num nodes level 32: %d\n", nodes_per_level[32]);
+    printf("Num nodes level 64: %d\n", nodes_per_level[64]);
+    */
 
     graph.max_score = graph.nodes[0].max_score;
     graph.max_score_node_id = 0;
@@ -37,30 +75,64 @@ AlignmentResult cpu_align_simd_parallel_node(Graph graph, Sequence sequence)
         }
     }
 
-    return compute_traceback_cpu_simd_parallel_node(graph, sequence);
+    free(nodes_per_level);
+    cudaFree(sequence_rev.sequence);
+    free(tmp.sequence);
+
+    Node* device_nodes_scratch = (Node*)malloc(graph.num_nodes * sizeof(Node));
+    cudaMemcpy(device_nodes_scratch, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
+
+    graph.max_score = device_nodes_scratch[0].max_score;
+    graph.max_score_node_id = 0;
+
+    for (int n = 0; n < graph.num_nodes; n++) {
+        graph.nodes[n].max_score   = device_nodes_scratch[n].max_score;
+        graph.nodes[n].max_score_d = device_nodes_scratch[n].max_score_d;
+        graph.nodes[n].max_score_i = device_nodes_scratch[n].max_score_i;
+        graph.nodes[n].max_score_j = device_nodes_scratch[n].max_score_j;
+        
+        if (device_nodes_scratch[n].max_score > graph.max_score) { 
+            graph.max_score = device_nodes_scratch[n].max_score; 
+            graph.max_score_node_id = n;
+        }
+
+        size_t matrix_size = (sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
+        cudaMemcpy(graph.nodes[n].dp_matrix, device_nodes_scratch[n].dp_matrix, 
+                   matrix_size * sizeof(DTYPEMATRIX), cudaMemcpyDeviceToHost);
+    }
+
+    // Clean up local tracking structures
+    free(device_nodes_scratch);
+
+    return compute_traceback_gpu_parallel_node(graph, sequence);
 }
 
-
-void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
+__global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequence sequence_rev)
 {
     // ------------------------------------------------- Initialize -------------------------------------------------
 
+    node = &node[blockIdx.x];
+    
     int M = sequence.size;
     int N = node->sequence.size;
     DTYPEMATRIX* __restrict dp = node->dp_matrix;
     
     if (node->num_in == 0) {
-        for (int i = 0; i <= M; ++i) dp[get_diagonal_index(i, 0, M, N)] = 0;
-        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
+        for (int i = threadIdx.x; i <= M; i += blockDim.x) 
+            dp[get_diagonal_index_device(i, 0, M, N)] = 0;
+        
+        for (int j = threadIdx.x + 1; j <= N; j += blockDim.x) 
+            dp[get_diagonal_index_device(0, j, M, N)] = 0;
     }
     else if (node->num_in == 1) {
         DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix;
         int prev_N = node->v_in[0]->sequence.size;
 
-        for (int i = 0; i <= M; ++i) {
-            dp[get_diagonal_index(i, 0, M, N)] = prev_dp[get_diagonal_index(i, prev_N, M, prev_N)];
-        }
-        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
+        for (int i = threadIdx.x; i <= M; i += blockDim.x)
+            dp[get_diagonal_index_device(i, 0, M, N)] = prev_dp[get_diagonal_index_device(i, prev_N, M, prev_N)];
+        
+        for (int j = threadIdx.x + 1; j <= N; j += blockDim.x) 
+            dp[get_diagonal_index_device(0, j, M, N)] = 0;
     }
     else {
         DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix; 
@@ -68,32 +140,27 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
         int prev_N1 = node->v_in[0]->sequence.size;
         int prev_N2 = node->v_in[1]->sequence.size;
 
-        for (int i = 0; i <= M; ++i) {
-            int score1 = prev_dp[get_diagonal_index(i, prev_N1, M, prev_N1)];
-            int score2 = prev_dp2[get_diagonal_index(i, prev_N2, M, prev_N2)];
-            dp[get_diagonal_index(i, 0, M, N)] = max(score1, score2);
+        for (int i = threadIdx.x; i <= M; i += blockDim.x) {
+            int score1 = prev_dp[get_diagonal_index_device(i, prev_N1, M, prev_N1)];
+            int score2 = prev_dp2[get_diagonal_index_device(i, prev_N2, M, prev_N2)];
+            dp[get_diagonal_index_device(i, 0, M, N)] = max(score1, score2);
         }
 
         for (int i = 2; i < node->num_in; ++i) {
             prev_dp = node->v_in[i]->dp_matrix;
             int prev_Ni = node->v_in[i]->sequence.size;
-            for (int j = 0; j <= M; ++j) {
-                int act = get_diagonal_index(j, 0, M, N);
-                dp[act] = max(prev_dp[get_diagonal_index(j, prev_Ni, M, prev_Ni)], dp[act]);
+            for (int j = threadIdx.x; j <= M; j += blockDim.x) {
+                int act = get_diagonal_index_device(j, 0, M, N);
+                dp[act] = max(prev_dp[get_diagonal_index_device(j, prev_Ni, M, prev_Ni)], dp[act]);
             }
         }
-        for (int j = 1; j <= N; ++j) dp[get_diagonal_index(0, j, M, N)] = 0;
+        for (int j = threadIdx.x + 1; j <= N; j += blockDim.x) dp[get_diagonal_index_device(0, j, M, N)] = 0;
     }
 
     // ------------------------------------------------- Compute -------------------------------------------------
     
     char* __restrict node_seq = node->sequence.sequence;
-    char* __restrict query_seq = sequence.sequence;
-
-    char* __restrict query_seq_rev = (char*)malloc(M * sizeof(char));
-    for (int idx = 0; idx < M; ++idx) {
-        query_seq_rev[idx] = query_seq[M - 1 - idx];
-    }
+    char* __restrict query_seq_rev = sequence_rev.sequence;
 
     int local_max = -1;
     int local_max_d = -1;
@@ -118,7 +185,7 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
         int prev_max = local_max;
         int d_size = d - 1;
 
-        for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+        for (int k = 1 + threadIdx.x; k <= d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
             int j = k - 1;
             int i = M - d + k;
 
@@ -131,15 +198,15 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
             int res = max(max(diagonal, 0), max(up, left));
             dp[startCurr + k] = res;
 
-            if (res > local_max) {
-                local_max = res;
-            }
+            local_max = max(res, local_max);
         }
 
         if (prev_max != local_max)
         {
             local_max_d = d;
         }
+
+        __syncthreads();
     }
 
     // --------------- Stable phase ------------------
@@ -153,7 +220,7 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
             int prev_max = local_max;
             int d_size = N;
 
-            for (int k = 1; k <= d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+            for (int k = 1 + threadIdx.x; k <= d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
                 int j = k - 1;
                 int i = M - d + k;
 
@@ -166,15 +233,15 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
                 int res = max(max(diagonal, 0), max(up, left));
                 dp[startCurr + k] = res;
 
-                if (res > local_max) {
-                    local_max = res;
-                }
+                local_max = max(res, local_max);
             }
 
             if (prev_max != local_max)
             {
                 local_max_d = d;
             }
+
+            __syncthreads();
         }
     }
     else {
@@ -190,7 +257,7 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
             int off_up   = max(0, d - 1 - M);
             int off_diag = max(0, d - 2 - M);
 
-            for (int k = off_curr; k < off_curr + d_size; ++k) { 
+            for (int k = off_curr + threadIdx.x; k < off_curr + d_size; k += blockDim.x) { 
                 int j = k - 1;
                 int i = M - d + k;
 
@@ -203,15 +270,15 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
                 int res = max(max(diagonal, 0), max(up, left));
                 dp[startCurr + k - off_curr] = res;
 
-                if (res > local_max) {
-                    local_max = res;
-                }
+                local_max = max(res, local_max);
             }
 
             if (prev_max != local_max)
             {
                 local_max_d = d;
             }
+
+            __syncthreads();
         }
     }
 
@@ -229,7 +296,7 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
         int off_up   = max(0, d - 1 - M);
         int off_diag = max(0, d - 2 - M);
 
-        for (int k = off_curr; k < off_curr + d_size; ++k) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+        for (int k = off_curr + threadIdx.x; k < off_curr + d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
             int j = k - 1;
             int i = M - d + k;
 
@@ -242,46 +309,87 @@ void compute_dp_cpu_simd_parallel_node(Node* node, Sequence sequence)
             int res = max(max(diagonal, 0), max(up, left));
             dp[startCurr + k - off_curr] = res;
 
-            if (res > local_max) {
-                local_max = res;
-            }
+            local_max = max(res, local_max);
         }
 
         if (prev_max != local_max)
         {
             local_max_d = d;
         }
-    }
 
-    free(query_seq_rev);
+        __syncthreads();
+    }
 
     // ------------------ Find j of local max ------------------
 
+    __syncthreads();
+
+    int t = threadIdx.x;
+    __shared__ int local_max_red[BLOCKSIZE];
+    __shared__ int local_max_d_red[BLOCKSIZE];
+
+    local_max_red[t] = local_max;
+    local_max_d_red[t] = local_max_d;
+
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            int curr_max = local_max_red[t];
+            int candidate = local_max_red[t + stride];
+            
+            int curr_d = local_max_d_red[t];
+            int candidate_d = local_max_d_red[t + stride];
+
+            bool is_greater = (candidate > curr_max);
+            
+            local_max_red[t]  = is_greater ? candidate : curr_max;
+            local_max_d_red[t] = is_greater ? candidate_d : curr_d; 
+        }
+        __syncthreads();
+    }
+
+    __syncthreads();
+
+    local_max = local_max_red[0];
+    local_max_d = local_max_d_red[0];
+
     if (local_max_d != -1) {
+
+        __shared__ int shared_min_j;
+        if (threadIdx.x == 0) {
+            shared_min_j = INT_MAX; 
+        }
+
+        __syncthreads();
         
         int final_d = local_max_d;
         int j_start = (local_max_d - M > 1) ? local_max_d - M : 1;
         int j_end = (local_max_d - 1 < N) ? local_max_d - 1 : N;
 
-        startCurr = get_diag_start(final_d, M, N);
+        startCurr = get_diag_start_device(final_d, M, N);
 
-        int off_curr = max(0, final_d - M); 
+        int off_curr = max(0, final_d - M);
 
-        for (int j = j_start; j <= j_end; j++) {
+        for (int j = j_start + threadIdx.x; j <= j_end; j += blockDim.x) {
             if (dp[startCurr + j - off_curr] == local_max) {
-                local_max_j = j;
-                break;
+                atomicMin(&shared_min_j, j);
             }
         }
+
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+            local_max_j = shared_min_j;
     }
 
-    node->max_score = local_max;
-    node->max_score_d = local_max_d;
-    node->max_score_i = (local_max_d != -1) ? (local_max_d - local_max_j) : -1;
-    node->max_score_j = local_max_j;
+    if (threadIdx.x == 0) {
+        node->max_score = local_max;
+        node->max_score_d = local_max_d;
+        node->max_score_i = (local_max_d != -1) ? (local_max_d - local_max_j) : -1;
+        node->max_score_j = local_max_j;
+    }
 }
 
-AlignmentResult compute_traceback_cpu_simd_parallel_node(Graph graph, Sequence sequence) {
+AlignmentResult compute_traceback_gpu_parallel_node(Graph graph, Sequence sequence) {
     Node* curr_node = &graph.nodes[graph.max_score_node_id];
     int i = curr_node->max_score_i; 
     int j = curr_node->max_score_j; 

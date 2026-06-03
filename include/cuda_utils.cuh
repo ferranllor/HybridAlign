@@ -1,5 +1,6 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#pragma once
 
 #define BLOCKSIZE 128
 

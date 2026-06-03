@@ -18,7 +18,7 @@ MAIN_NAME=main
 MAIN_BIN=$(MAIN_NAME)
 MAIN_SRC=$(MAIN_NAME).c
 
-OBJECTS = $(OBJ_FOLDER)/my_time_lib.o $(OBJ_FOLDER)/cpu_sequential.o $(OBJ_FOLDER)/cpu_simd.o $(OBJ_FOLDER)/cpu_simd_parallel_dp.o $(OBJ_FOLDER)/cpu_simd_parallel_node.o $(OBJ_FOLDER)/cuda_naive.o
+OBJECTS = $(OBJ_FOLDER)/my_time_lib.o $(OBJ_FOLDER)/cpu_sequential.o $(OBJ_FOLDER)/cpu_simd.o $(OBJ_FOLDER)/cpu_simd_parallel_dp.o $(OBJ_FOLDER)/cpu_simd_parallel_node.o $(OBJ_FOLDER)/cuda_naive.o $(OBJ_FOLDER)/cuda_parallel_node.o
 
 all: $(BIN_FOLDER)/$(MAIN_BIN)
 
@@ -45,6 +45,11 @@ $(OBJ_FOLDER)/cpu_simd_parallel_node.o: $(SRC_FOLDER)/cpu_simd_parallel_node.c
 $(OBJ_FOLDER)/cuda_naive.o: $(SRC_FOLDER)/cuda_naive.cu
 	@mkdir -p $(BIN_FOLDER) $(OBJ_FOLDER) $(BATCH_OUT_FOLDER)
 	$(CCNV) -c $(SRC_FOLDER)/cuda_naive.cu -o $@ $(LIB_FLAGS_NV) $(INCLUDES_NV)
+
+$(OBJ_FOLDER)/cuda_parallel_node.o: $(SRC_FOLDER)/cuda_parallel_node.cu
+	@mkdir -p $(BIN_FOLDER) $(OBJ_FOLDER) $(BATCH_OUT_FOLDER)
+	$(CCNV) -c $(SRC_FOLDER)/cuda_parallel_node.cu -o $@ $(LIB_FLAGS_NV) $(INCLUDES_NV)
+
 
 $(BIN_FOLDER)/$(MAIN_BIN): $(MAIN_SRC) $(OBJECTS)
 	mkdir -p $(BIN_FOLDER)

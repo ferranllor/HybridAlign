@@ -145,6 +145,37 @@ int free_gpu_graph(Graph* cudaGraph)
     return 0;
 }
 
+
+int init_cpu_graph_pinned(Graph* graph, int seqSize) {
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* node = &graph->nodes[n];
+        // Allocate with extra padding to safeguard the final diagonal tail offsets
+        size_t matrix_size = (seqSize + 2) * (graph->nodes[n].sequence.size + 2);
+        cudaMallocHost((void**)&graph->nodes[n].dp_matrix, matrix_size * sizeof(DTYPEMATRIX));
+
+        char* tmp;
+        cudaMallocHost((void**)&tmp, node->sequence.size * sizeof(char));
+        memcpy(tmp, node->sequence.sequence, node->sequence.size * sizeof(char));
+
+        free(node->sequence.sequence);
+        node->sequence.sequence = tmp;
+    }
+
+    return 0;
+}
+
+int free_cpu_graph_pinned(Graph* graph) {
+    for (int i = 0; i < graph->num_nodes; i++) {
+        cudaFreeHost(graph->nodes[i].sequence.sequence);
+        cudaFreeHost(graph->nodes[i].dp_matrix);
+        free(graph->nodes[i].v_in);
+        free(graph->nodes[i].v_out);
+    }
+    free(graph->nodes);
+
+    return 0;
+}
+    
 #ifdef __cplusplus
 }
 #endif
