@@ -2,7 +2,7 @@
 #include "device_launch_parameters.h"
 #pragma once
 
-#define BLOCKSIZE 128
+#define BLOCKSIZE 516
 
 __device__ static inline int get_diag_start_device(int d, int M, int N) {
     int l_min = (M < N) ? M : N;

@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string.h>
 #include <omp.h>
+#include <stdbool.h>
 
 #pragma once
 
@@ -11,6 +12,7 @@
 
 #define WARMUP 2
 #define NITER 10
+#define CHUNKSIZE 1024
 
 // *************************************************************************************************
 //
@@ -41,6 +43,15 @@ typedef struct Node {
 
     int max_score; int max_score_i; int max_score_j; int max_score_d;
 } Node;
+
+typedef struct Communicator {
+    int id;
+    bool* job_ready, *job_done, *done;
+
+    int* nodeId;
+
+    // TODO: Add stuff to comunicate to GPU that some columns are already done on the CPU, mainly small diagonals, and maybe also tell to stop earlier
+} Communicator;
 
 typedef struct Graph { 
     Node* nodes; int num_nodes;

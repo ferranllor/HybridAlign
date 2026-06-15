@@ -16,6 +16,7 @@
 
 #include "include/cuda_naive.cuh"
 #include "include/cuda_parallel_node.cuh"
+#include "include/cuda_shared_mem.cuh"
 
 // *************************************************************************************************
 //
@@ -371,10 +372,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, " --- Second argument: --- \n");
         fprintf(stderr, "0 = CPU-only\n"); 
         fprintf(stderr, "1 = GPU-only\n"); 
-        fprintf(stderr, "2 = CPU-GPU exec\n"); 
+        fprintf(stderr, "2 = CPU-GPU exec (WIP)\n"); 
         fprintf(stderr, " --- Third argument: --- \n"); 
         fprintf(stderr, "0: 0-3 For CPU-only\n"); 
-        fprintf(stderr, "1: 0-1 For GPU-only\n"); 
+        fprintf(stderr, "1: 0-3 For GPU-only\n"); 
         fprintf(stderr, "2: WIP\n"); 
         return -1; 
     }
@@ -425,6 +426,7 @@ int main(int argc, char *argv[]) {
             case 0: init_cpu_graph(&graph, sequence.size); break;
             case 1: init_cpu_graph_pinned(&graph, sequence.size); break;
             case 2: init_cpu_graph_pinned(&graph, sequence.size); break;
+            case 3: init_cpu_graph_pinned(&graph, sequence.size); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
         
@@ -454,14 +456,15 @@ int main(int argc, char *argv[]) {
             case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
             case 1: res = gpu_align_naive(graph, cudaGraph, sequence); break;
             case 2: res = gpu_align_parallel_node(graph, cudaGraph, sequence); break;
+            case 3: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
     }
         
     verify_alignment(res.graph_align, res.query_align, sequence_mod);
 
-    //printf("Graph Alignment: %s\n", res.graph_align);
-    //printf("Query Alignment: %s\n", res.query_align);
+    printf("Graph Alignment: %s\n", res.graph_align);
+    printf("Query Alignment: %s\n", res.query_align);
 
     free(res.graph_align);
     free(res.query_align);
@@ -492,6 +495,7 @@ int main(int argc, char *argv[]) {
                 case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
                 case 1: res = gpu_align_naive(graph, cudaGraph, sequence); break;
                 case 2: res = gpu_align_parallel_node(graph, cudaGraph, sequence); break;
+                case 3: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }
@@ -523,6 +527,7 @@ int main(int argc, char *argv[]) {
             case 0: free_cpu_graph(&graph); break;
             case 1: free_cpu_graph_pinned(&graph); break;
             case 2: free_cpu_graph_pinned(&graph); break;
+            case 3: free_cpu_graph_pinned(&graph); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
         

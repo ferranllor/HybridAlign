@@ -1,6 +1,6 @@
-#include "../include/cuda_parallel_node.cuh"
+#include "../include/cuda_naive.cuh"
 
-AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence sequence)
+AlignmentResult gpu_align_naive(Graph graph, Graph cudaGraph, Sequence sequence)
 {
     Sequence sequence_rev;
     Sequence tmp;
@@ -14,56 +14,33 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
 
     cudaMalloc((void**)&sequence_rev.sequence, sequence.size * sizeof(char));
     cudaMemcpy(sequence_rev.sequence, tmp.sequence, sequence.size * sizeof(char), cudaMemcpyHostToDevice);
-
-
-    int num_levels = graph.nodes[graph.num_nodes-1].depth + 1;
-    int* nodes_per_level = (int*)calloc(num_levels, sizeof(int));
-
-    for (int n = 0; n < graph.num_nodes; n++) {
-        int depth = graph.nodes[n].depth;
-        nodes_per_level[depth]++;
-    }
+    
+    dim3 gridDim(1);
+    dim3 blockDim(BLOCKSIZE);
 
     cudaError_t status;
-    Node* act = cudaGraph.nodes;
 
-    for (int d = 0; d < num_levels; d++)
+    for (int n = 0; n < graph.num_nodes; n++)
     {
-        dim3 gridDim(nodes_per_level[d]);
-        dim3 blockDim(BLOCKSIZE);
-
-        compute_dp_gpu_parallel_node<<<gridDim, blockDim>>>(act, sequence, sequence_rev);
+        compute_dp_gpu_naive<<<gridDim, blockDim>>>(&cudaGraph.nodes[n], sequence, sequence_rev);
         
         cudaError_t launch_status = cudaGetLastError();
         if (launch_status != cudaSuccess) {
-            fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
+            fprintf(stderr, "Kernel Launch Error on node %d: %s\n", n, cudaGetErrorString(launch_status));
         }
 
-        status = cudaDeviceSynchronize();
-        if (status != cudaSuccess) {
-            fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
+        if (graph.nodes[n].depth > graph.nodes[n - 1].depth) {
+            status = cudaDeviceSynchronize();
+            if (status != cudaSuccess) {
+                fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
+            }
         }
-
-        act = &act[nodes_per_level[d]];
     }
 
-    /*
-    int mean_nodes_per_level = 0;
-
-    for (int d = 0; d < num_levels; d++) {
-        mean_nodes_per_level += nodes_per_level[d];
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+        fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
     }
-
-    printf("Mean nodes per level: %f\n", (double)mean_nodes_per_level/(double)num_levels);
-    printf("Num nodes: %d\n", graph.num_nodes);
-
-    printf("Num nodes level 2: %d\n", nodes_per_level[2]);
-    printf("Num nodes level 4: %d\n", nodes_per_level[4]);
-    printf("Num nodes level 8: %d\n", nodes_per_level[8]);
-    printf("Num nodes level 16: %d\n", nodes_per_level[16]);
-    printf("Num nodes level 32: %d\n", nodes_per_level[32]);
-    printf("Num nodes level 64: %d\n", nodes_per_level[64]);
-    */
 
     graph.max_score = graph.nodes[0].max_score;
     graph.max_score_node_id = 0;
@@ -75,7 +52,6 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
         }
     }
 
-    free(nodes_per_level);
     cudaFree(sequence_rev.sequence);
     free(tmp.sequence);
 
@@ -104,15 +80,33 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
     // Clean up local tracking structures
     free(device_nodes_scratch);
 
-    return compute_traceback_gpu_parallel_node(graph, sequence);
+    return compute_traceback_gpu_naive(graph, sequence);
 }
 
-__global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequence sequence_rev)
+__global__ void worker(Node* nodes, Communicator* comm, Sequence sequence, Sequence sequence_rev)
+{
+    // Sync with CPU via atomics and then wo work 
+    while(!(comm->done[0]))
+    {
+        while (!(comm->job_ready[0]))
+        {
+            //do nothing
+        }
+
+        int n = comm->nodeId[0];
+
+        compute_dp_gpu_naive(&nodes[n], sequence, sequence_rev);
+
+        if (threadIdx.x == 0)
+            comm->job_ready[0] = true;
+    
+    }
+}
+
+__device__ void compute_dp_gpu_naive(Node* node, Sequence sequence, Sequence sequence_rev)
 {
     // ------------------------------------------------- Initialize -------------------------------------------------
 
-    node = &node[blockIdx.x];
-    
     int M = sequence.size;
     int N = node->sequence.size;
     DTYPEMATRIX* __restrict dp = node->dp_matrix;
@@ -177,15 +171,15 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
 
     // --------------- Grow phase ------------------
 
-    for (; d < l_min + 2 - 1; ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1
+    for (; d <= l_min; ++d) {
         startPrevPrev = startPrev;
         startPrev = startCurr;
         startCurr = startCurr + d;
 
         int prev_max = local_max;
-        int d_size = d + 1; // D_size is always the size of the current diagonal, and takes into account halo elements. Grow phase always has first row and columns, so +1, as d is always d_size -1 (so -1 + 2 = 1)
+        int d_size = d - 1;
 
-        for (int k = 1 + threadIdx.x; k < d_size - 1; k += blockDim.x) { // +1 for first column. -1 for first row
+        for (int k = 1 + threadIdx.x; k <= d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
             int j = k - 1;
             int i = M - d + k;
 
@@ -211,129 +205,17 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
 
     // --------------- Stable phase ------------------
 
-    int offset_col1 = (l_min == N); // If l_min = N, means we will always have the first col in our diagonal, elements are redundant so we start at index 1 to avoid them
-    int offset_row1 = (l_min == M); // Same thing, but with the first row, so we ignore the last element on the diagonal
-
-    if (N >= M) {
-        // Whiever is reading this, ignore this block, its just a matter of transitioning to a different way of indexing, because stuff is 
-        // not in memory as it should be for the math to be pretty. This still counts as stable phase for all intents and purposes.
-        // you will see that when the max is M this phase starts later. This happens because this shift is linked to when the first 
-        // column stops being there. Maybe you should look for a different way that is more "consistent"? Idk, things like this (chapuzas) make me think
-        // that I'm looking at the problem the wrong way... In any case, for now, it works, so everything is good.
-        {
+    if (l_min == N) {
+        for (; d <= l_max; ++d) {
             startPrevPrev = startPrev;
             startPrev = startCurr;
-            startCurr = startCurr + l_min + 1; // Offset of 1, since we will always have elements from top row or first column during stable phase
+            startCurr = startCurr + N + 1;
 
             int prev_max = local_max;
-            int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
+            int d_size = N;
 
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = d - M + k - offset_col1;
-                int i = k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-
-            ++d;
-        }
-
-        for (; d < l_max + 2 - 1; ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1, and stable is of size l_max - l_min elements, so (l_max - l_min) + l_min - 1 = l_max - 1
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + l_min + 1; // Offset of 1, since we will always have elements from top row or first column during stable phase
-
-            int prev_max = local_max;
-            int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
-
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = d - M + k - offset_col1;
-                int i = k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k + 1] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-        }
-
-        // --------------- Shrink phase -----------------
-
-        for (; d < M + N + 2 - 1; ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + (M + N) - d + 2;
-
-            int prev_max = local_max;
-            int d_size = (M + N) - d + 1;
-            
-            for (int k = threadIdx.x; k < d_size; k += blockDim.x) {
-                int j = d - M + k;
-                int i = k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k + 1] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-        }
-    }
-    else
-    {
-        // --------------- Stable phase ------------------
-        
-        for (; d < l_max + 2 - 1; ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1, and stable is of size l_max - l_min elements, so (l_max - l_min) + l_min - 1 = l_max - 1
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + l_min + 1; // Offset of 1, since we will always have elements from top row or first column during stable phase
-
-            int prev_max = local_max;
-            int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
-
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = k - offset_col1;
+            for (int k = 1 + threadIdx.x; k <= d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+                int j = k - 1;
                 int i = M - d + k;
 
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
@@ -355,64 +237,32 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
 
             __syncthreads();
         }
-
-        // --------------- Shrink phase -----------------
-
-        // You can find and explanation for this thing on the if branch on top, so do that if you're wandering what this is :)
-        {
+    }
+    else {
+        for (; d <= l_max; ++d) {
             startPrevPrev = startPrev;
             startPrev = startCurr;
-            startCurr = startCurr + (M + N) - d + 2;
+            startCurr = startCurr + M + 1;
 
             int prev_max = local_max;
-            int d_size = (M + N) - d + 1;
-            
-            for (int k = threadIdx.x; k < d_size; k += blockDim.x) {
-                int j = d - M - 1 + k;
-                int i = k;
+            int d_size = M;
+
+            int off_curr = max(0, d - M);
+            int off_up   = max(0, d - 1 - M);
+            int off_diag = max(0, d - 2 - M);
+
+            for (int k = off_curr + threadIdx.x; k < off_curr + d_size; k += blockDim.x) { 
+                int j = k - 1;
+                int i = M - d + k;
 
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
-                int diagonal    = dp[startPrevPrev + k] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
+                int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
+                int up          = dp[startPrev + k - off_up] + GAP;
+                int left        = dp[startPrev + k - 1 - off_up] + GAP;
 
                 int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-
-            ++d;
-        }
-
-        for (; d < M + N + 2 - 1; ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + (M + N) - d + 2;
-
-            int prev_max = local_max;
-            int d_size = (M + N) - d + 1;
-            
-            for (int k = threadIdx.x; k < d_size; k += blockDim.x) {
-                int j = d - M - 1 + k;
-                int i = k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k + 1] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
+                dp[startCurr + k - off_curr] = res;
 
                 local_max = max(res, local_max);
             }
@@ -426,7 +276,44 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
         }
     }
 
-       
+    // --------------- Shrink phase ------------------
+
+    for (; d <= (M+N); ++d) {
+        startPrevPrev = startPrev;
+        startPrev = startCurr;
+        startCurr = startCurr + (M + N) - d + 2;
+
+        int prev_max = local_max;
+        int d_size = (M + N) - d + 1;
+
+        int off_curr = max(0, d - M);
+        int off_up   = max(0, d - 1 - M);
+        int off_diag = max(0, d - 2 - M);
+
+        for (int k = off_curr + threadIdx.x; k < off_curr + d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
+            int j = k - 1;
+            int i = M - d + k;
+
+            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
+
+            int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
+            int up          = dp[startPrev + k - off_up] + GAP;
+            int left        = dp[startPrev + k - 1 - off_up] + GAP;
+
+            int res = max(max(diagonal, 0), max(up, left));
+            dp[startCurr + k - off_curr] = res;
+
+            local_max = max(res, local_max);
+        }
+
+        if (prev_max != local_max)
+        {
+            local_max_d = d;
+        }
+
+        __syncthreads();
+    }
+
     // ------------------ Find j of local max ------------------
 
     __syncthreads();
@@ -496,7 +383,7 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
     }
 }
 
-AlignmentResult compute_traceback_gpu_parallel_node(Graph graph, Sequence sequence) {
+AlignmentResult compute_traceback_gpu_naive(Graph graph, Sequence sequence) {
     Node* curr_node = &graph.nodes[graph.max_score_node_id];
     int i = curr_node->max_score_i; 
     int j = curr_node->max_score_j; 

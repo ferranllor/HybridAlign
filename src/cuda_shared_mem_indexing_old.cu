@@ -1,6 +1,6 @@
-#include "../include/cuda_parallel_node.cuh"
+#include "../include/cuda_shared_mem.cuh"
 
-AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence sequence)
+AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequence)
 {
     Sequence sequence_rev;
     Sequence tmp;
@@ -32,7 +32,7 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
         dim3 gridDim(nodes_per_level[d]);
         dim3 blockDim(BLOCKSIZE);
 
-        compute_dp_gpu_parallel_node<<<gridDim, blockDim>>>(act, sequence, sequence_rev);
+        compute_dp_gpu_shared_mem<<<gridDim, blockDim>>>(act, sequence, sequence_rev);
         
         cudaError_t launch_status = cudaGetLastError();
         if (launch_status != cudaSuccess) {
@@ -104,10 +104,10 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
     // Clean up local tracking structures
     free(device_nodes_scratch);
 
-    return compute_traceback_gpu_parallel_node(graph, sequence);
+    return compute_traceback_gpu_shared_mem(graph, sequence);
 }
 
-__global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequence sequence_rev)
+__global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequence sequence_rev)
 {
     // ------------------------------------------------- Initialize -------------------------------------------------
 
@@ -158,6 +158,126 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
     }
 
     // ------------------------------------------------- Compute -------------------------------------------------
+
+    // Okay, here we go, complicated stuff explanation below:
+    //
+    // Having a basic GPU implementation is cool, but we're memory bound. To solve this, a quick idea is to use shared memory
+    // since the latency is much much lower than global memory. However, shared mem is limited, so we can't just keep the entire 
+    // matrix inside the shared memory. Good news is we don't need to. The reality, is we only need the shared memory to keep that data
+    // which is required for compute, in our case, the diagonals, as shown below:
+    //
+    // x--------------------------------------------x
+    // |O X +                                       |
+    // |X +                                         |
+    // |+                                           |
+    // |                                            |
+    // |                                            |
+    // |                                            |
+    // |                                            |
+    // |                                            |
+    // x--------------------------------------------x
+    //
+    // The diagonal +, depends entirely and soley on O and X, which means, that we only need to ever keep 3 diagonals at a time.
+    // However, this is not enough. What if the diagonal is absurdly big and does not fit into shared memory either? We need to guarantee this,
+    // So as usual, we go for a divide and conquer strat. What we will do, is split the matrix into stripes, each reliant on the one below:
+    //
+    // x--------------------------------------------x
+    // |O X +                                       |
+    // |X +                                         |
+    // |+                                           |
+    // |--------------------------------------------|
+    // |P T F                                       |
+    // |T F                                         |
+    // |F                                           |
+    // |                                            |
+    // x--------------------------------------------x
+    //
+    // As we can see, what will happen is we now we can guarantee the amount of shared memory by setting the size of each stripe.
+    // However, things are not that easy. If data was like in the drawing, GPU performance would be abhorrent. Solving this is done in the same
+    // way as we do it for implementing a SIMD version on the CPU, with the ever-so-slightly small difference that this completly messes up how we
+    // access the memory, since now, we move from the easy drawing avobe to the monstrosity my mind birthed below, but bear with me, it looks scarier than it is:
+    //
+    // x-x
+    // |O|
+    // x---x
+    // |X X|
+    // x-----x
+    // |+ + +|
+    // x-------x
+    // |       |
+    // x---------x
+    // |         |
+    // x---------x
+    // |         |
+    // x---------x
+    // |         |
+    // x---------x
+    // |         |
+    // x---------x
+    // |       |
+    // x-------x
+    // |     |
+    // x-----x
+    // |   |
+    // x---x
+    // | |
+    // x-x
+    //
+    // Note this is not the same size as the example avobe, since it would make for a long scroll down. In here, each row represents a diagonal, 
+    // and contrary to what the drawing might make you think, this is allocated as a contigous single chunk of memory as big as the original array.
+    // Now also take into account that some elemets of the starting diagonals have to be ignored, as they correspond to halo elements resulting
+    // from the initialization process. The one good thing is that once that is solved, this (should) perform great, and automatic prefetchers 
+    // will catch on s atrided pattern for the stable phase, since you don't have to jump to  different sections in memory just to jump from 
+    // diagonal to diagonal (as you would do if you simplified this by allocating an array of arrays, each corresponding to a diagonal). 
+    // Now, remember what I told you about stripes? We got to do this here too. I will show you a drawing of that looks like on the drawing avobe,
+    // which I believe helps with grasping the concept.
+    //
+    // x-x
+    // |O|
+    // x---x
+    // |O O|
+    // x-----x
+    // |O O O|
+    // x-------x
+    // |X O O O|
+    // x---------x
+    // |X X O O O|
+    // x---------x
+    // |X X O O O|
+    // x---------x
+    // |X X O O O|
+    // x---------x
+    // |X X O O O|
+    // x---------x
+    // |X X O O|
+    // x-------x
+    // |X X O|
+    // x-----x
+    // |X X|
+    // x---x
+    // |X|
+    // x-x
+    //
+    // Here there are two stripes: X and O, and as you can see, nothing is symmetric, which, not cool, it makes my life harder.
+    // Nevertheless, we can still divide this into 3 distinct sections. Let's call the grow, stable and shrink. You might have 
+    // already guessed this from the names, but they correspond to different sections of the matrix. Specifically, where the diagonals are increasing
+    // in size, where it stay stable in size, and where they shrink. The good thing is that the behaviour inside these stays consistent, so
+    // we can just code different indexing strats for each phase, which just so happen to hapily contain the halo elements we mentioned earlier,
+    // making our life easier again. 
+    //
+    // I could now write the reason I index things the way I do, but since you've already read all of this, I'm guessing you either wanted 
+    // a high-level overview and/or have been condemned to work in this black hole of wasted time i call code. If you're the first guy, congrats, you're free now!
+    // If not, you will probably have to read it yourself since you probably plan to tinker with it. Either way, there is no use in my explaining it,
+    // so, good luck! you're on you own now ;)
+    //
+    // Okay, a few minutes have passed, and after getting stressed for a while I deleted and rewrote the code. Anyways, it is now both much simpler AND works.
+    // Let this be a reminder that the best strat when stuck is to write a guide on what you want to do AND redo everything from scratch.
+    // 
+    // Anyways, onto how this works. To implement the stripes it is really rather simple. We define a variable k_start, as to offset where the elements of the stripe begin
+    // on each diagonal the same way that we can see on the previous drawing. This really only has to be done on the grow phase. Outside of that, we can
+    // reuse old code that I know has indexing that works to work out if the current stripe falls out of bounds or should be computed by using the minimum one.
+    // I will keep two versions. One with the use of shared mem and one without, but both with the indexing, as I plan to do a comparison.
+    // You are reading the one without the use of shared mem.
     
     char* __restrict node_seq = node->sequence.sequence;
     char* __restrict query_seq_rev = sequence_rev.sequence;
@@ -169,171 +289,32 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
     int l_min = (M < N) ? M : N;
     int l_max = (M > N) ? M : N;
 
-    int startCurr = 1;
-    int startPrev = 0;
-    int startPrevPrev;
+    for (int startM = 0; startM < M; startM += BLOCKSIZE) {
+        int startCurr = get_diag_start_device(startM + 1, M, N);
+        int startPrev = get_diag_start_device(startM, M, N);
+        int startPrevPrev;
 
-    int d = 2;
+        int stripe_height = min(BLOCKSIZE, M - startM);
 
-    // --------------- Grow phase ------------------
+        int d = 2 + startM; // StartM corresponds exactly to the diagonal where we want to start. This is the reason we start at 2, to offset halo values
 
-    for (; d < l_min + 2 - 1; ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1
-        startPrevPrev = startPrev;
-        startPrev = startCurr;
-        startCurr = startCurr + d;
+        int k_start = 0;
 
-        int prev_max = local_max;
-        int d_size = d + 1; // D_size is always the size of the current diagonal, and takes into account halo elements. Grow phase always has first row and columns, so +1, as d is always d_size -1 (so -1 + 2 = 1)
+        // --------------- Grow phase ------------------
 
-        for (int k = 1 + threadIdx.x; k < d_size - 1; k += blockDim.x) { // +1 for first column. -1 for first row
-            int j = k - 1;
-            int i = M - d + k;
-
-            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-            int diagonal    = dp[startPrevPrev + k - 1] + score;
-            int up          = dp[startPrev + k] + GAP;
-            int left        = dp[startPrev + k - 1] + GAP;
-
-            int res = max(max(diagonal, 0), max(up, left));
-            dp[startCurr + k] = res;
-
-            local_max = max(res, local_max);
-        }
-
-        if (prev_max != local_max)
-        {
-            local_max_d = d;
-        }
-
-        __syncthreads();
-    }
-
-    // --------------- Stable phase ------------------
-
-    int offset_col1 = (l_min == N); // If l_min = N, means we will always have the first col in our diagonal, elements are redundant so we start at index 1 to avoid them
-    int offset_row1 = (l_min == M); // Same thing, but with the first row, so we ignore the last element on the diagonal
-
-    if (N >= M) {
-        // Whiever is reading this, ignore this block, its just a matter of transitioning to a different way of indexing, because stuff is 
-        // not in memory as it should be for the math to be pretty. This still counts as stable phase for all intents and purposes.
-        // you will see that when the max is M this phase starts later. This happens because this shift is linked to when the first 
-        // column stops being there. Maybe you should look for a different way that is more "consistent"? Idk, things like this (chapuzas) make me think
-        // that I'm looking at the problem the wrong way... In any case, for now, it works, so everything is good.
-        {
+        for (; d <= l_min; ++d) {
             startPrevPrev = startPrev;
             startPrev = startCurr;
-            startCurr = startCurr + l_min + 1; // Offset of 1, since we will always have elements from top row or first column during stable phase
+            startCurr = startCurr + d;
 
             int prev_max = local_max;
-            int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
+            int d_size = d - 1;
 
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = d - M + k - offset_col1;
-                int i = k;
+            int begin = 1 + threadIdx.x;
+            int end = d_size;
 
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-
-            ++d;
-        }
-
-        for (; d < l_max + 2 - 1; ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1, and stable is of size l_max - l_min elements, so (l_max - l_min) + l_min - 1 = l_max - 1
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + l_min + 1; // Offset of 1, since we will always have elements from top row or first column during stable phase
-
-            int prev_max = local_max;
-            int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
-
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = d - M + k - offset_col1;
-                int i = k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k + 1] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-        }
-
-        // --------------- Shrink phase -----------------
-
-        for (; d < M + N + 2 - 1; ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + (M + N) - d + 2;
-
-            int prev_max = local_max;
-            int d_size = (M + N) - d + 1;
-            
-            for (int k = threadIdx.x; k < d_size; k += blockDim.x) {
-                int j = d - M + k;
-                int i = k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k + 1] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-        }
-    }
-    else
-    {
-        // --------------- Stable phase ------------------
-        
-        for (; d < l_max + 2 - 1; ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1, and stable is of size l_max - l_min elements, so (l_max - l_min) + l_min - 1 = l_max - 1
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + l_min + 1; // Offset of 1, since we will always have elements from top row or first column during stable phase
-
-            int prev_max = local_max;
-            int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
-
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = k - offset_col1;
+            for (int k = k_start + begin; k <= min(begin + stripe_height, end); k += blockDim.x) {
+                int j = k - 1;
                 int i = M - d + k;
 
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
@@ -348,6 +329,8 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
                 local_max = max(res, local_max);
             }
 
+            if (d > (startM + stripe_height)) k_start++;
+
             if (prev_max != local_max)
             {
                 local_max_d = d;
@@ -356,63 +339,110 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
             __syncthreads();
         }
 
-        // --------------- Shrink phase -----------------
+        // --------------- Stable phase ------------------
 
-        // You can find and explanation for this thing on the if branch on top, so do that if you're wandering what this is :)
-        {
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + (M + N) - d + 2;
+        if (l_min == N) {
+            for (; d <= l_max; ++d) {
+                startPrevPrev = startPrev;
+                startPrev = startCurr;
+                startCurr = startCurr + N + 1;
 
-            int prev_max = local_max;
-            int d_size = (M + N) - d + 1;
-            
-            for (int k = threadIdx.x; k < d_size; k += blockDim.x) {
-                int j = d - M - 1 + k;
-                int i = k;
+                int prev_max = local_max;
+                int d_size = N;
 
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
+                int begin = 1 + threadIdx.x;
+                int end = d_size;
 
-                int diagonal    = dp[startPrevPrev + k] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
+                for (int k = k_start + begin; k <= min(begin + stripe_height, end); k += blockDim.x) {
+                    int j = k - 1;
+                    int i = M - d + k;
 
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
+                    int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
-                local_max = max(res, local_max);
+                    int diagonal    = dp[startPrevPrev + k - 1] + score;
+                    int up          = dp[startPrev + k] + GAP;
+                    int left        = dp[startPrev + k - 1] + GAP;
+
+                    int res = max(max(diagonal, 0), max(up, left));
+                    dp[startCurr + k] = res;
+
+                    local_max = max(res, local_max);
+                }
+
+                if (prev_max != local_max)
+                {
+                    local_max_d = d;
+                }
+
+                __syncthreads();
             }
+        }
+        else {
+            for (; d <= l_max; ++d) {
+                startPrevPrev = startPrev;
+                startPrev = startCurr;
+                startCurr = startCurr + M;
 
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
+                int prev_max = local_max;
+                int d_size = M;
+
+                int begin = threadIdx.x;
+                int end = d_size;
+
+                for (int k = k_start + begin; k <= min(begin + stripe_height, end); k += blockDim.x) {
+                    int j = k - 1;
+                    int i = M - d + k;
+
+                    int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
+
+                    int diagonal    = dp[startPrevPrev + k - 1] + score;
+                    int up          = dp[startPrev + k] + GAP;
+                    int left        = dp[startPrev + k - 1] + GAP;
+
+                    int res = max(max(diagonal, 0), max(up, left));
+                    dp[startCurr + k] = res;
+
+                    local_max = max(res, local_max);
+                }
+
+                if (prev_max != local_max)
+                {
+                    local_max_d = d;
+                }
+
+                __syncthreads();
             }
-
-            __syncthreads();
-
-            ++d;
         }
 
-        for (; d < M + N + 2 - 1; ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
+        // --------------- Shrink phase ------------------
+
+        for (; d <= (M+N); ++d) {
             startPrevPrev = startPrev;
             startPrev = startCurr;
             startCurr = startCurr + (M + N) - d + 2;
 
             int prev_max = local_max;
             int d_size = (M + N) - d + 1;
-            
-            for (int k = threadIdx.x; k < d_size; k += blockDim.x) {
-                int j = d - M - 1 + k;
-                int i = k;
+
+            int off_curr = max(0, d - M);
+            int off_up   = max(0, d - 1 - M);
+            int off_diag = max(0, d - 2 - M);
+
+            int begin = off_curr + threadIdx.x;
+            int end = off_curr + d_size;
+
+            for (int k = k_start + begin; k <= min(begin + stripe_height, end); k += blockDim.x) {
+                int j = k - 1;
+                int i = M - d + k;
 
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
 
-                int diagonal    = dp[startPrevPrev + k + 1] + score;
-                int up          = dp[startPrev + k + 1] + GAP;
-                int left        = dp[startPrev + k] + GAP;
+                int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
+                int up          = dp[startPrev + k - off_up] + GAP;
+                int left        = dp[startPrev + k - 1 - off_up] + GAP;
 
                 int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
+                dp[startCurr + k - off_curr] = res;
 
                 local_max = max(res, local_max);
             }
@@ -426,7 +456,6 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
         }
     }
 
-       
     // ------------------ Find j of local max ------------------
 
     __syncthreads();
@@ -472,7 +501,7 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
         int j_start = (local_max_d - M > 1) ? local_max_d - M : 1;
         int j_end = (local_max_d - 1 < N) ? local_max_d - 1 : N;
 
-        startCurr = get_diag_start_device(final_d, M, N);
+        int startCurr = get_diag_start_device(final_d, M, N);
 
         int off_curr = max(0, final_d - M);
 
@@ -494,9 +523,10 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
         node->max_score_i = (local_max_d != -1) ? (local_max_d - local_max_j) : -1;
         node->max_score_j = local_max_j;
     }
+
 }
 
-AlignmentResult compute_traceback_gpu_parallel_node(Graph graph, Sequence sequence) {
+AlignmentResult compute_traceback_gpu_shared_mem(Graph graph, Sequence sequence) {
     Node* curr_node = &graph.nodes[graph.max_score_node_id];
     int i = curr_node->max_score_i; 
     int j = curr_node->max_score_j; 
