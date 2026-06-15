@@ -586,6 +586,8 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
     local_max_red[t] = local_max;
     local_max_d_red[t] = local_max_d;
 
+    __syncthreads(); 
+
     for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (t < stride) {
             int curr_max = local_max_red[t];
@@ -601,8 +603,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         }
         __syncthreads();
     }
-
-    __syncthreads();
 
     local_max = local_max_red[0];
     local_max_d = local_max_d_red[0];

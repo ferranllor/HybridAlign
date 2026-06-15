@@ -338,6 +338,8 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
     int l_min = (M < N) ? M : N;
     int l_max = (M > N) ? M : N;  
 
+    __syncthreads();
+
     for (int startM = 2; startM < M; startM += BLOCKSIZE) {
         int startCurr = get_diag_start_device(startM - 1, M, N); // starts at 1
         int startPrev = get_diag_start_device(startM - 2, M, N); // starts at 0
@@ -396,6 +398,13 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 local_max = max(res, local_max);
             }
 
+            if (d > (startM + stripe_height - 2)) k_start++;
+
+            if (prev_max != local_max)
+            {
+                local_max_d = d;
+            }
+
             __syncthreads();
 
             // Now write the results of current to global mem, async
@@ -405,13 +414,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
             }
 
             __syncthreads();
-
-            if (d > (startM + stripe_height - 2)) k_start++;
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
 
             bufferAct = (bufferAct + 1) % nBuffers;
             bufferPrev = (bufferPrev + 1) % nBuffers;
@@ -458,6 +460,11 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                     local_max = max(res, local_max);
                 }
 
+                if (prev_max != local_max)
+                {
+                    local_max_d = d;
+                }
+
                 __syncthreads();
 
                 // Now write the results of current to global mem, async
@@ -467,11 +474,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 }
 
                 __syncthreads();
-
-                if (prev_max != local_max)
-                {
-                    local_max_d = d;
-                }
 
                 bufferAct = (bufferAct + 1) % nBuffers;
                 bufferPrev = (bufferPrev + 1) % nBuffers;
@@ -513,6 +515,11 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                     local_max = max(res, local_max);
                 }
 
+                if (prev_max != local_max)
+                {
+                    local_max_d = d;
+                }
+
                 __syncthreads();
 
                 // Now write the results of current to global mem, async
@@ -522,11 +529,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 }
 
                 __syncthreads();
-
-                if (prev_max != local_max)
-                {
-                    local_max_d = d;
-                }
 
                 bufferAct = (bufferAct + 1) % nBuffers;
                 bufferPrev = (bufferPrev + 1) % nBuffers;
@@ -576,11 +578,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 }
 
                 __syncthreads();
-
-                if (prev_max != local_max)
-                {
-                    local_max_d = d;
-                }
 
                 bufferAct = (bufferAct + 1) % nBuffers;
                 bufferPrev = (bufferPrev + 1) % nBuffers;
@@ -637,11 +634,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
                 __syncthreads();
 
-                if (prev_max != local_max)
-                {
-                    local_max_d = d;
-                }
-
                 bufferAct = (bufferAct + 1) % nBuffers;
                 bufferPrev = (bufferPrev + 1) % nBuffers;
                 bufferPrevPrev = (bufferPrevPrev + 1) % nBuffers;
@@ -690,11 +682,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 }
 
                 __syncthreads();
-
-                if (prev_max != local_max)
-                {
-                    local_max_d = d;
-                }
 
                 bufferAct = (bufferAct + 1) % nBuffers;
                 bufferPrev = (bufferPrev + 1) % nBuffers;
@@ -745,11 +732,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
                 __syncthreads();
 
-                if (prev_max != local_max)
-                {
-                    local_max_d = d;
-                }
-
                 bufferAct = (bufferAct + 1) % nBuffers;
                 bufferPrev = (bufferPrev + 1) % nBuffers;
                 bufferPrevPrev = (bufferPrevPrev + 1) % nBuffers;
@@ -769,6 +751,8 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
     local_max_red[t] = local_max;
     local_max_d_red[t] = local_max_d;
 
+    __syncthreads(); 
+
     for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (t < stride) {
             int curr_max = local_max_red[t];
@@ -784,8 +768,6 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         }
         __syncthreads();
     }
-
-    __syncthreads();
 
     local_max = local_max_red[0];
     local_max_d = local_max_d_red[0];

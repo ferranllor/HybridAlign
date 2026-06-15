@@ -6,7 +6,7 @@ INCLUDES=-I../../ -Iinclude
 LIB_FLAGS=-lm -Ofast -finline-functions -fopenmp
 
 INCLUDES_NV=-I../../ -Iinclude
-LIB_FLAGS_NV=-lm -Xcompiler -fopenmp -arch=sm_120
+LIB_FLAGS_NV=-lm -Xcompiler -fopenmp -arch=sm_121
 
 BIN_FOLDER := bin
 OBJ_FOLDER := obj
