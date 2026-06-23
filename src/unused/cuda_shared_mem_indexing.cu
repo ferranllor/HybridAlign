@@ -294,7 +294,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         int startPrev = get_diag_start_device(startM - 2, M, N); // starts at 0
         int startPrevPrev;
 
-        int stripe_height = min(BLOCKSIZE, M - startM - 2);
+        int stripe_height = min(BLOCKSIZE, M - startM + 2);
 
         int d = startM; // StartM corresponds exactly to the diagonal where we want to start. This is the reason we start at 2, to offset halo values
 
@@ -345,7 +345,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         int offset_row1 = (l_min == M); // Same thing, but with the first row, so we ignore the last element on the diagonal
 
         if (N >= M) {
-            // Whiever is reading this, ignore this block, its just a matter of transitioning to a different way of indexing, because stuff is 
+            // Whoever is reading this, ignore this block, its just a matter of transitioning to a different way of indexing, because stuff is 
             // not in memory as it should be for the math to be pretty. This still counts as stable phase for all intents and purposes.
             // you will see that when the max is M this phase starts later. This happens because this shift is linked to when the first 
             // column stops being there. Maybe you should look for a different way that is more "consistent"? Idk, things like this (chapuzas) make me think
@@ -424,7 +424,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
             // --------------- Shrink phase -----------------
 
-            for (; d < M + N + 2 - 1; ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
+            for (; d < startM + stripe_height + N + 2 - 2; ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
                 startPrevPrev = startPrev;
                 startPrev = startCurr;
                 startCurr = startCurr + (M + N) - d + 2;
@@ -434,7 +434,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
                 int blockStart = k_start;
                 int blockEnd = min(blockStart + stripe_height, d_size);
-                
+
                 for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x) {
                     int j = d - M + k;
                     int i = k;
@@ -461,8 +461,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         }
         else
         {
-            
-            for (; d < l_max + 2 - 1; ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1, and stable is of size l_max - l_min elements, so (l_max - l_min) + l_min - 1 = l_max - 1
+            for (; (d < l_max + 2 - 1) && (d < startM + N + stripe_height); ++d) { // +2 because starting d offset, -1 because grow is of size l_min - 1, and stable is of size l_max - l_min elements, so (l_max - l_min) + l_min - 1 = l_max - 1
                 startPrevPrev = startPrev;
                 startPrev = startCurr;
                 startCurr = startCurr + l_min + 1; // Offset of 1, since we will always have elements from top row or first column during stable phase
@@ -472,6 +471,8 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
                 int blockStart = k_start + offset_col1;
                 int blockEnd = min(blockStart + stripe_height, d_size - offset_row1);
+
+                if (threadIdx.x == 0 && (blockEnd - blockStart) > blockDim.x) printf("%d, %d, %d, %d\n", blockStart, blockEnd, stripe_height, d_size);
 
                 for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x) {
                     int j = k - offset_col1;
@@ -494,12 +495,14 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                     local_max_d = d;
                 }
 
+                if (d > (startM - 2 + stripe_height)) k_start++;
                 __syncthreads();
             }
 
             // --------------- Shrink phase -----------------
 
             // You can find and explanation for this thing on the if branch on top, so do that if you're wandering what this is :)
+            if ((d < l_max + 2) && (d < startM + N + stripe_height))
             {
                 startPrevPrev = startPrev;
                 startPrev = startCurr;
@@ -510,6 +513,8 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
                 int blockStart = k_start;
                 int blockEnd = min(blockStart + stripe_height, d_size);
+
+                if (threadIdx.x == 0 && (blockEnd - blockStart) > blockDim.x) printf("%d, %d, %d, %d\n", blockStart, blockEnd, stripe_height, d_size);
                 
                 for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x) {
                     int j = d - M - 1 + k;
@@ -537,7 +542,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 ++d;
             }
 
-            for (; d < M + N + 2 - 1; ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
+            for (; (d < M + N + 2 - 1) && (d < startM + N + stripe_height); ++d) { // +2 because of offset, l_min is of size l_min - 1, and stable of l_max - l_min. Shrink is of l_min, so that gives 2 + (l_min - 1) + (l_max - l_min) + l_min = 2 - 1 + l_max + l_min or M + N + 2 - 1
                 startPrevPrev = startPrev;
                 startPrev = startCurr;
                 startCurr = startCurr + (M + N) - d + 2;

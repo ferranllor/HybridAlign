@@ -75,7 +75,7 @@ void compute_dp_cpu_simd_parallel_dp(Node* node, Sequence sequence)
         query_seq_rev[idx] = query_seq[M - 1 - idx];
     }
 
-    int n_threads = 2; // Even with 1 its 2x worse just because of openMP overhead :(
+    int n_threads = 4; // Even with 1 its 2x worse just because of openMP overhead :(
 
     int* local_max_shared = (int*)malloc(sizeof(int) * n_threads);
     int* local_max_d_shared = (int*)malloc(sizeof(int) * n_threads);

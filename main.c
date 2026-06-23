@@ -16,6 +16,7 @@
 
 #include "include/cuda_naive.cuh"
 #include "include/cuda_parallel_node.cuh"
+#include "include/cuda_parallel_async.cuh"
 #include "include/cuda_shared_mem.cuh"
 
 // *************************************************************************************************
@@ -427,6 +428,7 @@ int main(int argc, char *argv[]) {
             case 1: init_cpu_graph_pinned(&graph, sequence.size); break;
             case 2: init_cpu_graph_pinned(&graph, sequence.size); break;
             case 3: init_cpu_graph_pinned(&graph, sequence.size); break;
+            case 4: init_cpu_graph_pinned(&graph, sequence.size); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
         
@@ -456,7 +458,8 @@ int main(int argc, char *argv[]) {
             case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
             case 1: res = gpu_align_naive(graph, cudaGraph, sequence); break;
             case 2: res = gpu_align_parallel_node(graph, cudaGraph, sequence); break;
-            case 3: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
+            case 3: res = gpu_align_parallel_async(graph, cudaGraph, sequence); break;
+            case 4: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
     }
@@ -495,7 +498,8 @@ int main(int argc, char *argv[]) {
                 case 0: res = gpu_align_naive(graph, cudaGraph, sequence); break;
                 case 1: res = gpu_align_naive(graph, cudaGraph, sequence); break;
                 case 2: res = gpu_align_parallel_node(graph, cudaGraph, sequence); break;
-                case 3: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
+                case 3: res = gpu_align_parallel_async(graph, cudaGraph, sequence); break;
+                case 4: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }
@@ -528,6 +532,7 @@ int main(int argc, char *argv[]) {
             case 1: free_cpu_graph_pinned(&graph); break;
             case 2: free_cpu_graph_pinned(&graph); break;
             case 3: free_cpu_graph_pinned(&graph); break;
+            case 4: free_cpu_graph_pinned(&graph); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
         

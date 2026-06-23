@@ -1,6 +1,6 @@
-#include "../include/cuda_parallel_node.cuh"
+#include "../include/cuda_parallel_async.cuh"
 
-AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence sequence)
+AlignmentResult gpu_align_parallel_async(Graph graph, Graph cudaGraph, Sequence sequence)
 {
     Sequence sequence_rev;
     Sequence tmp;
@@ -24,6 +24,15 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
         nodes_per_level[depth]++;
     }
 
+    cudaStream_t compute_stream, copy_stream;
+    cudaStreamCreate(&compute_stream);
+    cudaStreamCreate(&copy_stream);
+
+    Node* device_nodes_pointers = (Node*)malloc(graph.num_nodes * sizeof(Node));
+    cudaMemcpy(device_nodes_pointers, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
+
+    Node* device_nodes_tmp = (Node*)malloc(graph.num_nodes * sizeof(Node));
+
     cudaError_t status;
     Node* act = cudaGraph.nodes;
     int node_offset = 0;
@@ -33,64 +42,68 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
         dim3 gridDim(nodes_per_level[d]);
         dim3 blockDim(BLOCKSIZE);
 
-        compute_dp_gpu_parallel_node<<<gridDim, blockDim>>>(act, sequence, sequence_rev);
+        compute_dp_gpu_parallel_async<<<gridDim, blockDim, 0, compute_stream>>>(act, sequence, sequence_rev);
         
         cudaError_t launch_status = cudaGetLastError();
         if (launch_status != cudaSuccess) {
             fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
         }
 
-        status = cudaDeviceSynchronize();
-        if (status != cudaSuccess) {
-            fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
+        cudaEvent_t compute_done;
+        cudaEventCreate(&compute_done);
+        cudaEventRecord(compute_done, compute_stream);
+
+        cudaStreamWaitEvent(copy_stream, compute_done, 0);
+
+        size_t level_nodes_size = nodes_per_level[d] * sizeof(Node);
+        cudaMemcpyAsync(&device_nodes_tmp[node_offset], act, level_nodes_size, cudaMemcpyDeviceToHost, copy_stream);
+
+        for (int i = 0; i < nodes_per_level[d]; i++) {
+            int n = node_offset + i;
+            size_t matrix_size = (sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
+            
+            cudaMemcpyAsync(graph.nodes[n].dp_matrix, device_nodes_pointers[n].dp_matrix, 
+                            matrix_size * sizeof(DTYPEMATRIX), cudaMemcpyDeviceToHost, copy_stream);
         }
+
+        cudaEventDestroy(compute_done);
 
         act = &act[nodes_per_level[d]];
+        node_offset += nodes_per_level[d];
     }
 
-    graph.max_score = graph.nodes[0].max_score;
-    graph.max_score_node_id = 0;
-    for (int n = 1; n < graph.num_nodes; n++)
-    {
-        if (graph.nodes[n].max_score > graph.max_score) { 
-            graph.max_score = graph.nodes[n].max_score; 
-            graph.max_score_node_id = n;
-        }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+        fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
     }
 
-    free(nodes_per_level);
-    cudaFree(sequence_rev.sequence);
-    free(tmp.sequence);
-
-    Node* device_nodes_scratch = (Node*)malloc(graph.num_nodes * sizeof(Node));
-    cudaMemcpy(device_nodes_scratch, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
-
-    graph.max_score = device_nodes_scratch[0].max_score;
+    graph.max_score = device_nodes_tmp[0].max_score;
     graph.max_score_node_id = 0;
 
     for (int n = 0; n < graph.num_nodes; n++) {
-        graph.nodes[n].max_score   = device_nodes_scratch[n].max_score;
-        graph.nodes[n].max_score_d = device_nodes_scratch[n].max_score_d;
-        graph.nodes[n].max_score_i = device_nodes_scratch[n].max_score_i;
-        graph.nodes[n].max_score_j = device_nodes_scratch[n].max_score_j;
+        graph.nodes[n].max_score   = device_nodes_tmp[n].max_score;
+        graph.nodes[n].max_score_d = device_nodes_tmp[n].max_score_d;
+        graph.nodes[n].max_score_i = device_nodes_tmp[n].max_score_i;
+        graph.nodes[n].max_score_j = device_nodes_tmp[n].max_score_j;
         
-        if (device_nodes_scratch[n].max_score > graph.max_score) { 
-            graph.max_score = device_nodes_scratch[n].max_score; 
+        if (device_nodes_tmp[n].max_score > graph.max_score) { 
+            graph.max_score = device_nodes_tmp[n].max_score; 
             graph.max_score_node_id = n;
         }
-
-        size_t matrix_size = (sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
-        cudaMemcpy(graph.nodes[n].dp_matrix, device_nodes_scratch[n].dp_matrix, 
-                   matrix_size * sizeof(DTYPEMATRIX), cudaMemcpyDeviceToHost);
     }
 
-    // Clean up local tracking structures
-    free(device_nodes_scratch);
+    cudaStreamDestroy(compute_stream);
+    cudaStreamDestroy(copy_stream);
+    free(nodes_per_level);
+    cudaFree(sequence_rev.sequence);
+    free(tmp.sequence);
+    free(device_nodes_tmp);
+    free(device_nodes_pointers);
 
-    return compute_traceback_gpu_parallel_node(graph, sequence);
+    return compute_traceback_gpu_parallel_async(graph, sequence);
 }
 
-__global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequence sequence_rev)
+__global__ void compute_dp_gpu_parallel_async(Node* node, Sequence sequence, Sequence sequence_rev)
 {
     // ------------------------------------------------- Initialize -------------------------------------------------
 
@@ -479,7 +492,7 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
     }
 }
 
-AlignmentResult compute_traceback_gpu_parallel_node(Graph graph, Sequence sequence) {
+AlignmentResult compute_traceback_gpu_parallel_async(Graph graph, Sequence sequence) {
     Node* curr_node = &graph.nodes[graph.max_score_node_id];
     int i = curr_node->max_score_i; 
     int j = curr_node->max_score_j; 

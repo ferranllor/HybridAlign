@@ -1,5 +1,4 @@
 #include "../include/cuda_shared_mem.cuh"
-#include <cuda/barrier>
 
 AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequence)
 {
@@ -25,85 +24,87 @@ AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequ
         nodes_per_level[depth]++;
     }
 
-    cudaStream_t compute_stream, copy_stream;
-    cudaStreamCreate(&compute_stream);
-    cudaStreamCreate(&copy_stream);
-
-    Node* device_nodes_pointers = (Node*)malloc(graph.num_nodes * sizeof(Node));
-    cudaMemcpy(device_nodes_pointers, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
-
-    Node* device_nodes_tmp = (Node*)malloc(graph.num_nodes * sizeof(Node));
-
     cudaError_t status;
     Node* act = cudaGraph.nodes;
-    int node_offset = 0;
 
     for (int d = 0; d < num_levels; d++)
     {
         dim3 gridDim(nodes_per_level[d]);
         dim3 blockDim(BLOCKSIZE);
         
-        int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (BLOCKSIZE + BLOCKSIZE + graph.nodes[d].sequence.size + graph.nodes[d].sequence.size + sequence.size + 3 + ((BLOCKSIZE + 2) * N_BUFFERS));
-        dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + graph.nodes[d].sequence.size);
-        dynamic_shared_mem_bytes += sizeof(cuda::barrier<cuda::thread_scope_block>) * N_BUFFERS;
+        int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (BLOCKSIZE + BLOCKSIZE + graph.nodes[d].sequence.size + graph.nodes[d].sequence.size + sequence.size + 3 + ((BLOCKSIZE + 2) * 3));
 
-        compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
+        compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes>>>(act, sequence, sequence_rev);
         
         cudaError_t launch_status = cudaGetLastError();
         if (launch_status != cudaSuccess) {
             fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
         }
 
-        cudaEvent_t compute_done;
-        cudaEventCreate(&compute_done);
-        cudaEventRecord(compute_done, compute_stream);
-
-        cudaStreamWaitEvent(copy_stream, compute_done, 0);
-
-        size_t level_nodes_size = nodes_per_level[d] * sizeof(Node);
-        cudaMemcpyAsync(&device_nodes_tmp[node_offset], act, level_nodes_size, cudaMemcpyDeviceToHost, copy_stream);
-
-        for (int i = 0; i < nodes_per_level[d]; i++) {
-            int n = node_offset + i;
-            size_t matrix_size = (sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
-            
-            cudaMemcpyAsync(graph.nodes[n].dp_matrix, device_nodes_pointers[n].dp_matrix, 
-                            matrix_size * sizeof(DTYPEMATRIX), cudaMemcpyDeviceToHost, copy_stream);
+        status = cudaDeviceSynchronize();
+        if (status != cudaSuccess) {
+            fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
         }
 
-        cudaEventDestroy(compute_done);
-
         act = &act[nodes_per_level[d]];
-        node_offset += nodes_per_level[d];
     }
 
-    status = cudaDeviceSynchronize();
-    if (status != cudaSuccess) {
-        fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
+    /*
+    int mean_nodes_per_level = 0;
+
+    for (int d = 0; d < num_levels; d++) {
+        mean_nodes_per_level += nodes_per_level[d];
     }
 
-    graph.max_score = device_nodes_tmp[0].max_score;
+    printf("Mean nodes per level: %f\n", (double)mean_nodes_per_level/(double)num_levels);
+    printf("Num nodes: %d\n", graph.num_nodes);
+
+    printf("Num nodes level 2: %d\n", nodes_per_level[2]);
+    printf("Num nodes level 4: %d\n", nodes_per_level[4]);
+    printf("Num nodes level 8: %d\n", nodes_per_level[8]);
+    printf("Num nodes level 16: %d\n", nodes_per_level[16]);
+    printf("Num nodes level 32: %d\n", nodes_per_level[32]);
+    printf("Num nodes level 64: %d\n", nodes_per_level[64]);
+    */
+
+    graph.max_score = graph.nodes[0].max_score;
     graph.max_score_node_id = 0;
-
-    for (int n = 0; n < graph.num_nodes; n++) {
-        graph.nodes[n].max_score   = device_nodes_tmp[n].max_score;
-        graph.nodes[n].max_score_d = device_nodes_tmp[n].max_score_d;
-        graph.nodes[n].max_score_i = device_nodes_tmp[n].max_score_i;
-        graph.nodes[n].max_score_j = device_nodes_tmp[n].max_score_j;
-        
-        if (device_nodes_tmp[n].max_score > graph.max_score) { 
-            graph.max_score = device_nodes_tmp[n].max_score; 
+    for (int n = 1; n < graph.num_nodes; n++)
+    {
+        if (graph.nodes[n].max_score > graph.max_score) { 
+            graph.max_score = graph.nodes[n].max_score; 
             graph.max_score_node_id = n;
         }
     }
 
-    cudaStreamDestroy(compute_stream);
-    cudaStreamDestroy(copy_stream);
     free(nodes_per_level);
     cudaFree(sequence_rev.sequence);
     free(tmp.sequence);
-    free(device_nodes_tmp);
-    free(device_nodes_pointers);
+
+    Node* device_nodes_scratch = (Node*)malloc(graph.num_nodes * sizeof(Node));
+    cudaMemcpy(device_nodes_scratch, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
+
+    graph.max_score = device_nodes_scratch[0].max_score;
+    graph.max_score_node_id = 0;
+
+    for (int n = 0; n < graph.num_nodes; n++) {
+        graph.nodes[n].max_score   = device_nodes_scratch[n].max_score;
+        graph.nodes[n].max_score_d = device_nodes_scratch[n].max_score_d;
+        graph.nodes[n].max_score_i = device_nodes_scratch[n].max_score_i;
+        graph.nodes[n].max_score_j = device_nodes_scratch[n].max_score_j;
+        
+        if (device_nodes_scratch[n].max_score > graph.max_score) { 
+            graph.max_score = device_nodes_scratch[n].max_score; 
+            graph.max_score_node_id = n;
+        }
+
+        size_t matrix_size = (sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
+        cudaMemcpy(graph.nodes[n].dp_matrix, device_nodes_scratch[n].dp_matrix, 
+                   matrix_size * sizeof(DTYPEMATRIX), cudaMemcpyDeviceToHost);
+    }
+
+    // Clean up local tracking structures
+    free(device_nodes_scratch);
 
     return compute_traceback_gpu_shared_mem(graph, sequence);
 }
@@ -118,14 +119,9 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
     int N = node->sequence.size;
     DTYPEMATRIX* __restrict dp = node->dp_matrix;
 
-    __shared__ DTYPEMATRIX dpBuffers[N_BUFFERS][BLOCKSIZE+2];
-    __shared__ cuda::barrier<cuda::thread_scope_block> write_barriers[N_BUFFERS];
+    const int nBuffers = 3;
 
-    if (threadIdx.x == 0) {
-    for (int b = 0; b < N_BUFFERS; ++b) {
-        init(&write_barriers[b], blockDim.x); 
-    }
-}
+    __shared__ DTYPEMATRIX dpBuffers[nBuffers][BLOCKSIZE+2];
 
     extern __shared__ DTYPEMATRIX shared[];
 
@@ -209,18 +205,8 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         for (int j = threadIdx.x + 1; j <= N; j += blockDim.x) dp[get_diagonal_index_device(0, j, M, N)] = 0;
     }
 
-    DTYPEALPHABET* node_seq = (DTYPEALPHABET*)&prevCol[M + 1];
-    DTYPEALPHABET* query_seq_rev = &node_seq[N];
-
-    for (int i = threadIdx.x; i < node->sequence.size; i+= blockDim.x)
-    {
-        node_seq[i] = node->sequence.sequence[i];
-    }
-
-    for (int i = threadIdx.x; i < sequence_rev.size; i+= blockDim.x)
-    {
-        query_seq_rev[i] = sequence_rev.sequence[i];
-    }
+    char* __restrict node_seq = node->sequence.sequence; // TODO: move this into shared memory.
+    char* __restrict query_seq_rev = sequence_rev.sequence;
 
     int local_max = -1;
     int local_max_d = -1;
@@ -273,218 +259,63 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         bufferPrevPrev = (bufferPrevPrev + 1) % N_BUFFERS;
     };
 
-
-    auto process_stripe_tma = [&](int blockStart, int blockEnd, int current_d,
-                            int j_offset, int i_offset, 
-                            int off_diag, int off_up, int off_left) {
-        
-        
-        write_barriers[bufferAct].wait(write_barriers[bufferAct].arrive());
-        int prev_max = local_max;
-
-        for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x) {
-            int j = j_offset + k;
-            int i = i_offset + k;
-
-            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-            int diagonal = dpBuffers[bufferPrevPrev][k + off_diag] + score;
-            int up       = dpBuffers[bufferPrev][k + off_up] + GAP;
-            int left     = dpBuffers[bufferPrev][k + off_left] + GAP;
-
-            int res = max(max(diagonal, 0), max(up, left));
-            dpBuffers[bufferAct][k] = res;
-
-            local_max = max(res, local_max);
-        }
-
-        if (prev_max != local_max) {
-            local_max_d = current_d;
-        }
-
-        __syncthreads(); 
-
-        if (threadIdx.x == 0) {
-            size_t copy_bytes = (blockEnd - blockStart) * sizeof(int);
-            
-            cuda::memcpy_async(
-                &dp[startCurr + k_start + blockStart], 
-                &dpBuffers[bufferAct][blockStart], 
-                copy_bytes, 
-                write_barriers[bufferAct]
-            );
-        }
-
-        bufferAct      = (bufferAct + 1) % N_BUFFERS;
-        bufferPrev     = (bufferPrev + 1) % N_BUFFERS;
-        bufferPrevPrev = (bufferPrevPrev + 1) % N_BUFFERS;
-    };
-
     __syncthreads();
 
-    if (M >= N) {
-        for (int startN = 0; startN < N; startN += BLOCKSIZE) {
-            startCurr = get_diag_start_device(startN + 1, M, N); // starts at 1
-            startPrev = get_diag_start_device(startN, M, N); // starts at 0
+    for (int startM = 2; startM < M; startM += BLOCKSIZE) {
+        startCurr = get_diag_start_device(startM - 1, M, N); // starts at 1
+        startPrev = get_diag_start_device(startM - 2, M, N); // starts at 0
 
-            int stripe_height = min(BLOCKSIZE, N - startN);
+        int stripe_height = min(BLOCKSIZE, M - startM + 2);
 
-            int d = 2 + startN;
+        int d = startM; // StartM corresponds exactly to the diagonal where we want to start. This is the reason we start at 2, to offset halo values
 
-            k_start = startN;
+        k_start = 0;
 
-            bufferAct = 2, bufferPrev = 1, bufferPrevPrev = 0;
-            
+        bufferAct = 2, bufferPrev = 1, bufferPrevPrev = 0;
+        
+        if (threadIdx.x == 0) {
+            dpBuffers[bufferPrevPrev][0] = dp[startPrev];
+            dpBuffers[bufferPrev][1] = dp[startCurr + 1];
+            dpBuffers[bufferPrev][0] = dp[startCurr];
+        }
+
+        __syncthreads();
+
+        // --------------- Grow phase ------------------
+
+        for (; d < l_min + 2 - 1; ++d) {
+            startPrev = startCurr;
+            startCurr = startCurr + d;
+
+            int d_size = d + 1;
+            int blockStart = 1 + k_start;
+            int blockEnd = min(blockStart + stripe_height, d_size - 1);
+
             if (threadIdx.x == 0) {
-                dpBuffers[bufferPrevPrev][0] = dp[startPrev];
-                dpBuffers[bufferPrev][1] = dp[startCurr + 1];
-                dpBuffers[bufferPrev][0] = dp[startCurr];
+                dpBuffers[bufferAct][0] = prevCol[d];
+                dpBuffers[bufferAct][blockEnd] = topRow[d - 2];
             }
-
             __syncthreads();
 
-            // --------------- Grow phase ------------------
-
-            for (; d < l_min + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + d;
-
-                int d_size = d + 1;
-                int blockStart = k_start + 1;
-                int blockEnd = min(blockStart + stripe_height, d_size - 1);
-
-                if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d];
-                    dpBuffers[bufferAct][blockEnd] = topRow[d - 2];
-                }
-
-                __syncthreads();
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                            k_start - 1, k_start + M - d, 
-                            -1, 0, -1);
-
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
-            }
-            
-            // --------------- Stable phase ------------------
-
-            int d_size = l_min + 1;
-
-            for (; d < l_max + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + l_min + 1;
-
-                int blockStart = k_start + 1;
-                int blockEnd = min(blockStart + stripe_height, d_size);
-
-                if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d];
-                }
-
-                __syncthreads();
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
+            process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
                         k_start - 1, k_start + M - d, 
                         -1, 0, -1);
-                
 
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
-            }
+            if (d > (startM - 2 + stripe_height)) k_start++;
 
-            // --------------- Shrink phase -----------------
-
-            if (d < startN + stripe_height + M + 2 - 1)
-            {
-                startPrev = startCurr;
-                startCurr = startCurr + (M + N) - d + 2;
-
-                d_size = (M + N) - d + 1;
-
-                int blockStart = k_start;
-                int blockEnd = min(blockStart + stripe_height, d_size);
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        d - M - 1 + k_start, k_start, 
-                        0, 1, 0);
-                
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
-                
-                if (k_start > 0) k_start--;
-                ++d;
-            }
-
-            for (; d < startN + stripe_height + M + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + (M + N) - d + 2;
-
-                d_size = (M + N) - d + 1;
-
-                int blockStart = k_start;
-                int blockEnd = min(blockStart + stripe_height, d_size);
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start + d - M - 1, k_start, 
-                        1, 1, 0);
-
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
-
-                if (k_start > 0) k_start--;
-            }
+            if (threadIdx.x == 0) topRow[d - (startM + stripe_height - 2)] = dpBuffers[bufferPrev][0];
         }
-    }
-    else {
-        for (int startM = 0; startM < M; startM += BLOCKSIZE) {
-            startCurr = get_diag_start_device(startM + 1, M, N); // starts at 1
-            startPrev = get_diag_start_device(startM, M, N); // starts at 0
 
-            int stripe_height = min(BLOCKSIZE, M - startM);
+        int offset_col1 = (l_min == N);
+        int offset_row1 = (l_min == M);
 
-            int d = 2 + startM; // StartM corresponds exactly to the diagonal where we want to start. This is the reason we start at 2, to offset halo values
-
-            k_start = 0;
-
-            bufferAct = 2, bufferPrev = 1, bufferPrevPrev = 0;
-            
-            if (threadIdx.x == 0) {
-                dpBuffers[bufferPrevPrev][0] = dp[startPrev];
-                dpBuffers[bufferPrev][1] = dp[startCurr + 1];
-                dpBuffers[bufferPrev][0] = dp[startCurr];
-            }
-
-            __syncthreads();
-
-            // --------------- Grow phase ------------------
-
-            for (; d < l_min + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + d;
-
-                int d_size = d + 1;
-                int blockStart = k_start + 1;
-                int blockEnd = min(blockStart + stripe_height, d_size - 1);
-
-                if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d];
-                    dpBuffers[bufferAct][blockEnd] = topRow[d - 2];
-                }
-                __syncthreads();
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                            k_start - 1, k_start + M - d, 
-                            -1, 0, -1);
-
-                if (d > (startM + stripe_height)) k_start++;
-
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
-            }
-
+        if (N >= M) {
 
             // --------------- Stable phase ------------------
             
             int d_size = l_min + 1;
-            int blockStart = k_start;
-            int blockEnd = min(blockStart + stripe_height, d_size - 1);
+            int blockStart = offset_col1 + k_start;
+            int blockEnd = min(blockStart + stripe_height, d_size - offset_row1);
 
             if (d < l_min + 2)
             {
@@ -498,10 +329,10 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 __syncthreads();
 
                 process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start + d - M - 1, k_start, 
+                        k_start + d - M - offset_col1, k_start, 
                         0, 1, 0);
 
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height - 2)] = dpBuffers[bufferPrev][0];
                 
                 ++d;
             }
@@ -517,17 +348,17 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 __syncthreads();
 
                 process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start + d - M - 1, k_start, 
+                        k_start + d - M - offset_col1, k_start, 
                         1, 1, 0);
                 
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height - 2)] = dpBuffers[bufferPrev][0];
             }
 
             // --------------- Shrink phase -----------------
 
             blockStart = k_start;
 
-            for (; d < startM + stripe_height + N + 2 - 1; ++d) { 
+            for (; d < startM + stripe_height + N + 2 - 2; ++d) { 
                 startPrev = startCurr;
                 startCurr = startCurr + (M + N) - d + 2;
 
@@ -535,15 +366,76 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 blockEnd = min(blockStart + stripe_height, d_size);
                 
                 process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
+                        k_start + d - M, k_start, 
+                        1, 1, 0);
+
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height - 2)] = dpBuffers[bufferPrev][0];
+            }
+        }
+        else {
+            // --------------- Stable phase ------------------
+
+            int d_size = l_min + 1;
+
+            for (; (d < l_max + 2 - 1) && (d < startM + N + stripe_height + 1); ++d) {
+                startPrev = startCurr;
+                startCurr = startCurr + l_min + 1;
+
+                int blockStart = offset_col1 + k_start;
+                int blockEnd = min(blockStart + stripe_height, d_size - offset_row1);
+
+                if (threadIdx.x == 0) {
+                    dpBuffers[bufferAct][0] = prevCol[d];
+                }
+
+                __syncthreads();
+
+                if (threadIdx.x == 0 && (blockStart < 0 || ((blockEnd - blockStart) > blockDim.x))) printf("blockStart: %d, blockEnd: %d, d_size %d, stripe_height %d\n", blockStart, blockEnd, d_size, stripe_height);
+
+                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
+                        k_start - offset_col1, k_start + M - d, 
+                        -1, 0, -1);
+                
+                if (d > (startM - 2 + stripe_height)) k_start++;
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height - 2)] = dpBuffers[bufferPrev][0];
+            }
+
+            // --------------- Shrink phase -----------------
+
+            int blockStart = k_start;
+
+            if ((d < l_max + 2) && (d < startM + N + stripe_height + 1))
+            {
+                startPrev = startCurr;
+                startCurr = startCurr + (M + N) - d + 2;
+
+                d_size = (M + N) - d + 1;
+                int blockEnd = min(blockStart + stripe_height, d_size);
+
+                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
+                        d - M - 1 + k_start, k_start, 
+                        0, 1, 0);
+                
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height - 2)] = dpBuffers[bufferPrev][0];
+
+                ++d;
+            }
+
+            for (; d < (M + N + 2 - 1) && (d < startM + N + stripe_height + 1); ++d) {
+                startPrev = startCurr;
+                startCurr = startCurr + (M + N) - d + 2;
+
+                d_size = (M + N) - d + 1;
+                int blockEnd = min(blockStart + stripe_height, d_size);
+
+                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
                         k_start + d - M - 1, k_start, 
                         1, 1, 0);
 
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height - 2)] = dpBuffers[bufferPrev][0];
             }
         }
     }
-    
-    __syncthreads();
 
     // ------------------ Find j of local max ------------------
 

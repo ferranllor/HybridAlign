@@ -10,9 +10,9 @@
 #define DTYPEALPHABET char
 #define DTYPEMATRIX int
 
-#define WARMUP 2
-#define NITER 10
-#define CHUNKSIZE 128
+#define WARMUP 1
+#define NITER 3
+#define CHUNKSIZE 32
 
 // *************************************************************************************************
 //
