@@ -12,7 +12,8 @@
 extern "C" {
 #endif
 
-int init_cpu_graph(Graph* graph, int seqSize) {
+int init_cpu_graph(Graph* graph, int seqSize) 
+{
     for (int n = 0; n < graph->num_nodes; n++) {
         // Allocate with extra padding to safeguard the final diagonal tail offsets
         size_t matrix_size = (seqSize + 2) * (graph->nodes[n].sequence.size + 2); 
@@ -20,7 +21,8 @@ int init_cpu_graph(Graph* graph, int seqSize) {
     }
 }
 
-int free_cpu_graph(Graph* graph) {
+int free_cpu_graph(Graph* graph) 
+{
     for (int i = 0; i < graph->num_nodes; i++) {
         free(graph->nodes[i].sequence.sequence);
         if(graph->nodes[i].dp_matrix) free(graph->nodes[i].dp_matrix);
@@ -42,6 +44,18 @@ int init_gpu_graph(Graph* graph, Graph* cudaGraph, int seqSize)
     Node* device_nodes = (Node*)malloc(graph->num_nodes * sizeof(Node));
     if (device_nodes == NULL) { return -1; }
 
+    size_t num_elems = 0;
+
+    for (int n = 0; n < graph->num_nodes; n++)
+        num_elems += graph->nodes[n].sequence.size + 2;
+
+    num_elems *= (seqSize + 2);
+
+    DTYPEMATRIX* dpmatrices = NULL;
+
+    cudaStatus = cudaMalloc((void**)&dpmatrices, num_elems * sizeof(DTYPEMATRIX));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "dp_matrix allocation failed!\n"); return -2; }
+
     for (int n = 0; n < graph->num_nodes; n++) {
         Node* h_node = &graph->nodes[n];
         Node* d_node = &device_nodes[n];
@@ -50,9 +64,10 @@ int init_gpu_graph(Graph* graph, Graph* cudaGraph, int seqSize)
         d_node->num_in = h_node->num_in;
         d_node->num_out = h_node->num_out;
 
-        size_t matrix_size = (seqSize + 2) * (h_node->sequence.size + 2); 
-        cudaStatus = cudaMalloc((void**)&d_node->dp_matrix, matrix_size * sizeof(DTYPEMATRIX));
-        if (cudaStatus != cudaSuccess) { fprintf(stderr, "dp_matrix allocation failed!\n"); return -2; }
+        d_node->dp_matrix = dpmatrices;
+
+        size_t matrix_size = (seqSize + 2) * (h_node->sequence.size + 2);
+        dpmatrices = &dpmatrices[matrix_size];
 
         d_node->sequence.size = h_node->sequence.size;
         cudaStatus = cudaMalloc((void**)&d_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET));
@@ -127,10 +142,11 @@ int free_gpu_graph(Graph* cudaGraph)
         return -1;
     }
 
+    cudaFree(device_nodes[0].dp_matrix);
+
     for (int n = 0; n < cudaGraph->num_nodes; n++) {
         Node* node = &device_nodes[n];
 
-        cudaFree(node->dp_matrix);
         cudaFree(node->sequence.sequence);
         cudaFree(node->v_in);
         cudaFree(node->v_out);
@@ -146,12 +162,26 @@ int free_gpu_graph(Graph* cudaGraph)
 }
 
 
-int init_cpu_graph_pinned(Graph* graph, int seqSize) {
+int init_cpu_graph_pinned(Graph* graph, int seqSize) 
+{
+
+    size_t num_elems = 0;
+    for (int n = 0; n < graph->num_nodes; n++) {
+        num_elems += (graph->nodes[n].sequence.size + 2);
+    }
+    num_elems *= (seqSize + 2);
+
+    DTYPEMATRIX* dpmatrices = NULL;
+    cudaMallocHost((void**)&dpmatrices, num_elems * sizeof(DTYPEMATRIX));
+
     for (int n = 0; n < graph->num_nodes; n++) {
         Node* node = &graph->nodes[n];
         // Allocate with extra padding to safeguard the final diagonal tail offsets
+        
+        graph->nodes[n].dp_matrix = dpmatrices;
+
         size_t matrix_size = (seqSize + 2) * (graph->nodes[n].sequence.size + 2);
-        cudaMallocHost((void**)&graph->nodes[n].dp_matrix, matrix_size * sizeof(DTYPEMATRIX));
+        dpmatrices = &dpmatrices[matrix_size];
 
         char* tmp;
         cudaMallocHost((void**)&tmp, node->sequence.size * sizeof(char));
@@ -164,10 +194,12 @@ int init_cpu_graph_pinned(Graph* graph, int seqSize) {
     return 0;
 }
 
-int free_cpu_graph_pinned(Graph* graph) {
+int free_cpu_graph_pinned(Graph* graph) 
+{
+    cudaFreeHost(graph->nodes[0].dp_matrix); // original adress of the buffer containing all dp matrices
+
     for (int i = 0; i < graph->num_nodes; i++) {
         cudaFreeHost(graph->nodes[i].sequence.sequence);
-        cudaFreeHost(graph->nodes[i].dp_matrix);
         free(graph->nodes[i].v_in);
         free(graph->nodes[i].v_out);
     }

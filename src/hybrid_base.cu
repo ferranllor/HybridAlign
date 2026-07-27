@@ -1,6 +1,15 @@
 #include "../include/cuda_naive.cuh"
+#include "../include/cuda_parallel_node.cuh"
+#include "../include/cuda_parallel_async.cuh"
+#include "../include/cuda_async_monolithic.cuh"
+#include "../include/cuda_shared_mem.cuh"
 
-AlignmentResult gpu_align_naive(Graph graph, Graph cudaGraph, Sequence sequence)
+#include "../include/cpu_sequential.h"
+#include "../include/cpu_simd.h"
+#include "../include/cpu_simd_parallel_dp.h"
+#include "../include/cpu_simd_parallel_node.h"
+
+AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence sequence)
 {
     Sequence sequence_rev;
     Sequence tmp;

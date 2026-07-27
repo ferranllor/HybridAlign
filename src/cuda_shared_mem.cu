@@ -16,7 +16,6 @@ AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequ
     cudaMalloc((void**)&sequence_rev.sequence, sequence.size * sizeof(char));
     cudaMemcpy(sequence_rev.sequence, tmp.sequence, sequence.size * sizeof(char), cudaMemcpyHostToDevice);
 
-
     int num_levels = graph.nodes[graph.num_nodes-1].depth + 1;
     int* nodes_per_level = (int*)calloc(num_levels, sizeof(int));
 
@@ -32,49 +31,76 @@ AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequ
     Node* device_nodes_pointers = (Node*)malloc(graph.num_nodes * sizeof(Node));
     cudaMemcpy(device_nodes_pointers, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
 
-    Node* device_nodes_tmp = (Node*)malloc(graph.num_nodes * sizeof(Node));
+    Node* device_nodes_tmp = NULL;
+    cudaMallocHost((void**)&device_nodes_tmp, graph.num_nodes * sizeof(Node));
 
     cudaError_t status;
     Node* act = cudaGraph.nodes;
     int node_offset = 0;
 
+    cudaEvent_t compute_done;
+    cudaEventCreate(&compute_done);
+
+    const int BATCH_LEVELS = 8; // smaller = more overlap, larger = fewer commands
+    int batch_start_offset = 0;   // node_offset at start of current batch
+    Node* batch_start_act  = act; // device pointer at start of current batch
+    int levels_in_batch = 0;
+
     for (int d = 0; d < num_levels; d++)
     {
         dim3 gridDim(nodes_per_level[d]);
         dim3 blockDim(BLOCKSIZE);
-        
+
         int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (BLOCKSIZE + BLOCKSIZE + graph.nodes[d].sequence.size + graph.nodes[d].sequence.size + sequence.size + 3 + ((BLOCKSIZE + 2) * N_BUFFERS));
         dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + graph.nodes[d].sequence.size);
         dynamic_shared_mem_bytes += sizeof(cuda::barrier<cuda::thread_scope_block>) * N_BUFFERS;
 
         compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
-        
+
         cudaError_t launch_status = cudaGetLastError();
         if (launch_status != cudaSuccess) {
             fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
         }
 
-        cudaEvent_t compute_done;
-        cudaEventCreate(&compute_done);
-        cudaEventRecord(compute_done, compute_stream);
-
-        cudaStreamWaitEvent(copy_stream, compute_done, 0);
-
-        size_t level_nodes_size = nodes_per_level[d] * sizeof(Node);
-        cudaMemcpyAsync(&device_nodes_tmp[node_offset], act, level_nodes_size, cudaMemcpyDeviceToHost, copy_stream);
-
-        for (int i = 0; i < nodes_per_level[d]; i++) {
-            int n = node_offset + i;
-            size_t matrix_size = (sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
-            
-            cudaMemcpyAsync(graph.nodes[n].dp_matrix, device_nodes_pointers[n].dp_matrix, 
-                            matrix_size * sizeof(DTYPEMATRIX), cudaMemcpyDeviceToHost, copy_stream);
-        }
-
-        cudaEventDestroy(compute_done);
-
         act = &act[nodes_per_level[d]];
         node_offset += nodes_per_level[d];
+        levels_in_batch++;
+
+        bool last_level = (d == num_levels - 1);
+        bool batch_full = (levels_in_batch >= BATCH_LEVELS);
+
+        if (batch_full || last_level) {
+            // one sync point for the whole batch, not one per level
+            cudaEventRecord(compute_done, compute_stream);
+            cudaStreamWaitEvent(copy_stream, compute_done, 0);
+
+            int batch_num_nodes = node_offset - batch_start_offset;
+            size_t batch_nodes_size = (size_t)batch_num_nodes * sizeof(Node);
+
+            cudaMemcpyAsync(&device_nodes_tmp[batch_start_offset],
+                            batch_start_act,
+                            batch_nodes_size,
+                            cudaMemcpyDeviceToHost,
+                            copy_stream);
+
+            size_t batch_matrix_elements = 0;
+            for (int n = batch_start_offset; n < node_offset; n++) {
+                batch_matrix_elements += (size_t)(sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
+            }
+
+            if (batch_matrix_elements > 0) {
+                cudaMemcpyAsync(graph.nodes[batch_start_offset].dp_matrix,
+                                device_nodes_pointers[batch_start_offset].dp_matrix,
+                                batch_matrix_elements * sizeof(DTYPEMATRIX),
+                                cudaMemcpyDeviceToHost,
+                                copy_stream);
+            }
+
+            // reset batch trackers
+            batch_start_offset = node_offset;
+            batch_start_act = act;
+            levels_in_batch = 0;
+        }
     }
 
     status = cudaDeviceSynchronize();
@@ -90,19 +116,20 @@ AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequ
         graph.nodes[n].max_score_d = device_nodes_tmp[n].max_score_d;
         graph.nodes[n].max_score_i = device_nodes_tmp[n].max_score_i;
         graph.nodes[n].max_score_j = device_nodes_tmp[n].max_score_j;
-        
-        if (device_nodes_tmp[n].max_score > graph.max_score) { 
-            graph.max_score = device_nodes_tmp[n].max_score; 
+
+        if (device_nodes_tmp[n].max_score > graph.max_score) {
+            graph.max_score = device_nodes_tmp[n].max_score;
             graph.max_score_node_id = n;
         }
     }
 
+    cudaEventDestroy(compute_done);
     cudaStreamDestroy(compute_stream);
     cudaStreamDestroy(copy_stream);
     free(nodes_per_level);
     cudaFree(sequence_rev.sequence);
     free(tmp.sequence);
-    free(device_nodes_tmp);
+    cudaFreeHost(device_nodes_tmp);
     free(device_nodes_pointers);
 
     return compute_traceback_gpu_shared_mem(graph, sequence);
