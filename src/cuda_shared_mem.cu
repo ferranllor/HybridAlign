@@ -292,7 +292,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
         for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x)
             dp[startCurr + k_start + k] = dpBuffers[bufferAct][k];
         
-        __syncthreads(); 
+        
 
         // 3. Buffer Rotation
         bufferAct      = (bufferAct + 1) % N_BUFFERS;
@@ -381,8 +381,8 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 int blockEnd = min(blockStart + stripe_height, d_size - 1);
 
                 if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d];
-                    dpBuffers[bufferAct][blockEnd] = topRow[d - 2];
+                    dpBuffers[bufferAct][0] = prevCol[d - startN];
+                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1];
                 }
 
                 __syncthreads();
@@ -391,7 +391,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                             k_start - 1, k_start + M - d, 
                             -1, 0, -1);
 
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
+                if (threadIdx.x == 0 && d > BLOCKSIZE + startN) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
             }
             
             // --------------- Stable phase ------------------
@@ -406,7 +406,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 int blockEnd = min(blockStart + stripe_height, d_size);
 
                 if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d];
+                    dpBuffers[bufferAct][0] = prevCol[d - startN];
                 }
 
                 __syncthreads();
@@ -416,7 +416,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                         -1, 0, -1);
                 
 
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
+                if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
             }
 
             // --------------- Shrink phase -----------------
@@ -435,7 +435,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                         d - M - 1 + k_start, k_start, 
                         0, 1, 0);
                 
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
+                if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
                 
                 if (k_start > 0) k_start--;
                 ++d;
@@ -454,7 +454,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                         k_start + d - M - 1, k_start, 
                         1, 1, 0);
 
-                //if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1];
+                if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
 
                 if (k_start > 0) k_start--;
             }
@@ -493,7 +493,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
                 if (threadIdx.x == 0) {
                     dpBuffers[bufferAct][0] = prevCol[d];
-                    dpBuffers[bufferAct][blockEnd] = topRow[d - 2];
+                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1 - startM];
                 }
                 __syncthreads();
 
@@ -503,7 +503,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
                 if (d > (startM + stripe_height)) k_start++;
 
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0 && d > BLOCKSIZE + startM) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
             }
 
 
@@ -519,7 +519,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 startCurr = startCurr + l_min + 1;
 
                 if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][blockEnd] = topRow[d - 1];
+                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1 - startM];
                 }
 
                 __syncthreads();
@@ -528,7 +528,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                         k_start + d - M - 1, k_start, 
                         0, 1, 0);
 
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
                 
                 ++d;
             }
@@ -538,7 +538,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                 startCurr = startCurr + l_min + 1;
 
                 if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][blockEnd] = topRow[d - 1];
+                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1 - startM];
                 }
 
                 __syncthreads();
@@ -547,7 +547,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                         k_start + d - M - 1, k_start, 
                         1, 1, 0);
                 
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
             }
 
             // --------------- Shrink phase -----------------
@@ -565,7 +565,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
                         k_start + d - M - 1, k_start, 
                         1, 1, 0);
 
-                //if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
             }
         }
     }

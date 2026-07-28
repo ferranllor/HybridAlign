@@ -2,7 +2,7 @@
 #include "device_launch_parameters.h"
 #pragma once
 
-#define BLOCKSIZE 160
+#define BLOCKSIZE 480
 #define N_BUFFERS 6
 
 __device__ static inline int get_diag_start_device(int d, int M, int N) {
