@@ -305,8 +305,14 @@ __global__ void compute_dp_gpu_naive(Node* node, Sequence sequence, Sequence seq
     local_max_red[t] = local_max;
     local_max_d_red[t] = local_max_d;
 
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (t < stride) {
+    __syncthreads();
+
+    // blockDim.x is not necessarily a power of two (BLOCKSIZE = 480), so the live range has to be
+    // halved rounding up: a plain >>= 1 silently drops the last element on every odd-sized step.
+    for (unsigned int live = blockDim.x; live > 1; ) {
+        unsigned int stride = (live + 1) / 2;
+
+        if (t + stride < live) {
             int curr_max = local_max_red[t];
             int candidate = local_max_red[t + stride];
             
@@ -319,6 +325,7 @@ __global__ void compute_dp_gpu_naive(Node* node, Sequence sequence, Sequence seq
             local_max_d_red[t] = is_greater ? candidate_d : curr_d; 
         }
         __syncthreads();
+        live = stride;
     }
 
     __syncthreads();

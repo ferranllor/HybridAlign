@@ -2,8 +2,14 @@
 #include "device_launch_parameters.h"
 #pragma once
 
+// Overridable from the command line (-DBLOCKSIZE=...) so tools/verify.sh can sweep them
+#ifndef BLOCKSIZE
 #define BLOCKSIZE 480
+#endif
+
+#ifndef N_BUFFERS
 #define N_BUFFERS 6
+#endif
 
 __device__ static inline int get_diag_start_device(int d, int M, int N) {
     int l_min = (M < N) ? M : N;

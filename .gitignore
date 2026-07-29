@@ -12,3 +12,7 @@ utils/gensequence.sh
 *.nsys-rep
 .vscode/*
 
+outputs/*
+src/unused
+tools/bin/*
+tools/obj/*

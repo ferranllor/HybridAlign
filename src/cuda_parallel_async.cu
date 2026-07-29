@@ -224,8 +224,8 @@ __global__ void compute_dp_gpu_parallel_async(Node* node, Sequence sequence, Seq
             int prev_max = local_max;
             int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
 
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = d - M + k - offset_col1;
+            for (int k = threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
+                int j = d - M + k - 1;
                 int i = k;
 
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
@@ -258,8 +258,8 @@ __global__ void compute_dp_gpu_parallel_async(Node* node, Sequence sequence, Seq
             int prev_max = local_max;
             int d_size = l_min + 1; // +1 for one of the two offsets, whichever applies
 
-            for (int k = offset_col1 + threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
-                int j = d - M + k - offset_col1;
+            for (int k = threadIdx.x; k < d_size - offset_row1; k += blockDim.x) { 
+                int j = d - M + k - 1;
                 int i = k;
 
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
@@ -293,7 +293,7 @@ __global__ void compute_dp_gpu_parallel_async(Node* node, Sequence sequence, Seq
             int d_size = (M + N) - d + 1;
             
             for (int k = threadIdx.x; k < d_size; k += blockDim.x) {
-                int j = d - M + k;
+                int j = d - M + k - 1;
                 int i = k;
 
                 int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
@@ -436,8 +436,12 @@ __global__ void compute_dp_gpu_parallel_async(Node* node, Sequence sequence, Seq
 
     __syncthreads(); 
 
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (t < stride) {
+    // blockDim.x is not necessarily a power of two (BLOCKSIZE = 480), so the live range has to be
+    // halved rounding up: a plain >>= 1 silently drops the last element on every odd-sized step.
+    for (unsigned int live = blockDim.x; live > 1; ) {
+        unsigned int stride = (live + 1) / 2;
+
+        if (t + stride < live) {
             int curr_max = local_max_red[t];
             int candidate = local_max_red[t + stride];
             
@@ -450,6 +454,7 @@ __global__ void compute_dp_gpu_parallel_async(Node* node, Sequence sequence, Seq
             local_max_d_red[t] = is_greater ? candidate_d : curr_d; 
         }
         __syncthreads();
+        live = stride;
     }
 
     local_max = local_max_red[0];

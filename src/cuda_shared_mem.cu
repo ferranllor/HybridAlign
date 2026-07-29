@@ -51,9 +51,15 @@ AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequ
         dim3 gridDim(nodes_per_level[d]);
         dim3 blockDim(BLOCKSIZE);
 
-        int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (BLOCKSIZE + BLOCKSIZE + graph.nodes[d].sequence.size + graph.nodes[d].sequence.size + sequence.size + 3 + ((BLOCKSIZE + 2) * N_BUFFERS));
-        dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + graph.nodes[d].sequence.size);
-        dynamic_shared_mem_bytes += sizeof(cuda::barrier<cuda::thread_scope_block>) * N_BUFFERS;
+        // The kernel lays out topRow (N + 1), prevCol (M + 1), node_seq (N) and query_seq_rev (M)
+        // in dynamic shared memory, so it has to be sized after the largest node of *this* level
+        // (dpBuffers, the barriers and the reduction arrays are static shared memory).
+        int max_node_size = 0;
+        for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++)
+            if (graph.nodes[n].sequence.size > max_node_size) max_node_size = graph.nodes[n].sequence.size;
+
+        int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (max_node_size + sequence.size + 2);
+        dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + max_node_size);
 
         compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
 
@@ -253,24 +259,33 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
     int local_max_d = -1;
     int local_max_j = -1;
 
-    int l_min = (M < N) ? M : N;
-    int l_max = (M > N) ? M : N;  
+    // The matrix is walked band by band: BLOCKSIZE consecutive columns at a time when M >= N,
+    // BLOCKSIZE consecutive rows at a time when M < N (i.e. always along the shorter side, so a
+    // whole anti-diagonal of the band fits in one dpBuffers row). Inside a band the local buffer
+    // index k is tied to the band coordinate and *not* to the position inside the diagonal, so the
+    // neighbour offsets stay constant for every diagonal and every phase:
+    //
+    //   M >= N : k = j - startN            -> up = [k], left = [k-1], diagonal = [k-1]
+    //   M <  N : k = (startM + h) + 1 - i   -> up = [k+1], left = [k], diagonal = [k+1]
+    //
+    // k = 0 (resp. k = h + 1) is the halo slot holding the neighbouring column/row that the band
+    // does not own: the carry column startN (prevCol) / the carry row startM (topRow), plus the
+    // top row of the matrix where the diagonal has not reached the end of the band yet.
 
-    int startCurr, startPrev;
     int bufferAct, bufferPrev, bufferPrevPrev;
-    int k_start;
+    int write_base; // dp[write_base + k] is where local index k of the current diagonal is stored
 
-    auto process_stripe_small = [&](int blockStart, int blockEnd, int current_d,
-                            int j_offset, int i_offset, 
+    auto process_diagonal = [&](int klo, int khi, int current_d,
+                            int node_off, int query_off,
                             int off_diag, int off_up, int off_left) {
         int prev_max = local_max;
 
-        // 1. Compute Phase
-        for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x) {
-            int j = j_offset + k;
-            int i = i_offset + k;
-
-            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
+        // 1. Compute, and write straight through to global memory: a thread only ever reads back
+        //    the cell it wrote itself, so the store needs no barrier and no second pass over the
+        //    buffer. (The barrier below is for the *next* diagonal, which reads this one's cells
+        //    across threads.)
+        for (int k = klo + threadIdx.x; k <= khi; k += blockDim.x) {
+            int score = (node_seq[node_off + k] == query_seq_rev[query_off + k]) ? MATCH : MISMATCH;
 
             int diagonal = dpBuffers[bufferPrevPrev][k + off_diag] + score;
             int up       = dpBuffers[bufferPrev][k + off_up] + GAP;
@@ -278,6 +293,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
             int res = max(max(diagonal, 0), max(up, left));
             dpBuffers[bufferAct][k] = res;
+            dp[write_base + k] = res;
 
             local_max = max(res, local_max);
         }
@@ -286,34 +302,25 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
             local_max_d = current_d;
         }
 
-        // 2. Async write to global memory
         __syncthreads();
 
-        for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x)
-            dp[startCurr + k_start + k] = dpBuffers[bufferAct][k];
-        
-        
-
-        // 3. Buffer Rotation
-        bufferAct      = (bufferAct + 1) % N_BUFFERS;
-        bufferPrev     = (bufferPrev + 1) % N_BUFFERS;
-        bufferPrevPrev = (bufferPrevPrev + 1) % N_BUFFERS;
+        // 2. Buffer Rotation. N_BUFFERS is not a power of two, so wrap with a select instead of
+        //    paying for three integer modulos on every diagonal.
+        bufferPrevPrev = bufferPrev;
+        bufferPrev     = bufferAct;
+        bufferAct      = (bufferAct + 1 == N_BUFFERS) ? 0 : bufferAct + 1;
     };
 
 
-    auto process_stripe_tma = [&](int blockStart, int blockEnd, int current_d,
-                            int j_offset, int i_offset, 
+    auto process_diagonal_tma = [&](int klo, int khi, int current_d,
+                            int node_off, int query_off,
                             int off_diag, int off_up, int off_left) {
-        
-        
+
         write_barriers[bufferAct].wait(write_barriers[bufferAct].arrive());
         int prev_max = local_max;
 
-        for (int k = blockStart + threadIdx.x; k < blockEnd; k += blockDim.x) {
-            int j = j_offset + k;
-            int i = i_offset + k;
-
-            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
+        for (int k = klo + threadIdx.x; k <= khi; k += blockDim.x) {
+            int score = (node_seq[node_off + k] == query_seq_rev[query_off + k]) ? MATCH : MISMATCH;
 
             int diagonal = dpBuffers[bufferPrevPrev][k + off_diag] + score;
             int up       = dpBuffers[bufferPrev][k + off_up] + GAP;
@@ -329,15 +336,15 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
             local_max_d = current_d;
         }
 
-        __syncthreads(); 
+        __syncthreads();
 
         if (threadIdx.x == 0) {
-            size_t copy_bytes = (blockEnd - blockStart) * sizeof(int);
-            
+            size_t copy_bytes = (khi - klo + 1) * sizeof(DTYPEMATRIX);
+
             cuda::memcpy_async(
-                &dp[startCurr + k_start + blockStart], 
-                &dpBuffers[bufferAct][blockStart], 
-                copy_bytes, 
+                &dp[write_base + klo],
+                &dpBuffers[bufferAct][klo],
+                copy_bytes,
                 write_barriers[bufferAct]
             );
         }
@@ -350,226 +357,169 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
     __syncthreads();
 
     if (M >= N) {
+        // Bands of columns [js, je]. prevCol carries column startN over from the previous band.
         for (int startN = 0; startN < N; startN += BLOCKSIZE) {
-            startCurr = get_diag_start_device(startN + 1, M, N); // starts at 1
-            startPrev = get_diag_start_device(startN, M, N); // starts at 0
-
             int stripe_height = min(BLOCKSIZE, N - startN);
 
-            int d = 2 + startN;
+            int js = startN + 1;                // first column owned by the band
+            int je = startN + stripe_height;    // last column owned by the band
 
-            k_start = startN;
+            __syncthreads();
 
             bufferAct = 2, bufferPrev = 1, bufferPrevPrev = 0;
-            
+
+            // Seed the two diagonals that precede the band: (0, startN) and (0, startN + 1) sit on
+            // the top row, (1, startN) is the first cell of the carry column.
             if (threadIdx.x == 0) {
-                dpBuffers[bufferPrevPrev][0] = dp[startPrev];
-                dpBuffers[bufferPrev][1] = dp[startCurr + 1];
-                dpBuffers[bufferPrev][0] = dp[startCurr];
+                dpBuffers[bufferPrevPrev][0] = topRow[startN];
+                dpBuffers[bufferPrev][0]     = prevCol[1];
+                dpBuffers[bufferPrev][1]     = topRow[startN + 1];
             }
 
             __syncthreads();
 
+            int d = js + 1;                                     // first diagonal that hits the band
+            int diag_start = get_diag_start_device(d, M, N);    // where diagonal d starts in dp
+
             // --------------- Grow phase ------------------
+            // The band's piece of the diagonal is still growing: it runs from the carry column down
+            // to the top row of the matrix, which is still inside the band. Note this ends at je,
+            // not at l_min: what grows is the band's piece, not the matrix diagonal.
 
-            for (; d < l_min + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + d;
+            for (; d <= je; ++d) {
+                int khi = d - 1 - startN;               // the cell above it is on the top row
 
-                int d_size = d + 1;
-                int blockStart = k_start + 1;
-                int blockEnd = min(blockStart + stripe_height, d_size - 1);
+                write_base = diag_start + startN;       // d <= M, so no column is missing yet
 
                 if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d - startN];
-                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1];
+                    dpBuffers[bufferAct][0]       = prevCol[d - startN];  // carry column
+                    dpBuffers[bufferAct][khi + 1] = topRow[d];            // top row of the matrix
                 }
 
-                __syncthreads();
+                process_diagonal(1, khi, d, startN - 1, M - d + startN, -1, 0, -1);
 
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                            k_start - 1, k_start + M - d, 
-                            -1, 0, -1);
-
-                if (threadIdx.x == 0 && d > BLOCKSIZE + startN) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
+                diag_start += d + 1;                    // diagonal d holds d + 1 cells (d <= N)
             }
-            
+
             // --------------- Stable phase ------------------
+            // The band is full: every diagonal crosses all of its columns, so the last one is
+            // finished on each pass and can be handed over to the next band.
 
-            int d_size = l_min + 1;
+            for (; d <= M; ++d) {
+                write_base = diag_start + startN;
 
-            for (; d < l_max + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + l_min + 1;
+                if (threadIdx.x == 0) dpBuffers[bufferAct][0] = prevCol[d - startN];
 
-                int blockStart = k_start + 1;
-                int blockEnd = min(blockStart + stripe_height, d_size);
+                process_diagonal(1, stripe_height, d, startN - 1, M - d + startN, -1, 0, -1);
 
-                if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d - startN];
-                }
+                if (threadIdx.x == 0) prevCol[d - je] = dpBuffers[bufferPrev][stripe_height];
 
-                __syncthreads();
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start - 1, k_start + M - d, 
-                        -1, 0, -1);
-                
-
-                if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
+                diag_start += min(d, N) + 1;            // d + 1 while d <= N, then N + 1
             }
 
             // --------------- Shrink phase -----------------
+            // Past d = M the matrix diagonals start losing their first column, so the band's piece
+            // starts further and further in until only its last column is left.
 
-            if (d < startN + stripe_height + M + 2 - 1)
-            {
-                startPrev = startCurr;
-                startCurr = startCurr + (M + N) - d + 2;
+            for (; d <= je + M; ++d) {
+                int j_min = d - M;                      // first column stored on this diagonal
+                int klo = max(1, j_min - startN);
 
-                d_size = (M + N) - d + 1;
+                write_base = diag_start + startN - j_min;
 
-                int blockStart = k_start;
-                int blockEnd = min(blockStart + stripe_height, d_size);
+                // The carry column only exists while its cell is still inside the matrix.
+                if (threadIdx.x == 0 && j_min <= startN) dpBuffers[bufferAct][0] = prevCol[d - startN];
 
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        d - M - 1 + k_start, k_start, 
-                        0, 1, 0);
-                
-                if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
-                
-                if (k_start > 0) k_start--;
-                ++d;
-            }
+                process_diagonal(klo, stripe_height, d, startN - 1, M - d + startN, -1, 0, -1);
 
-            for (; d < startN + stripe_height + M + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + (M + N) - d + 2;
+                if (threadIdx.x == 0) prevCol[d - je] = dpBuffers[bufferPrev][stripe_height];
 
-                d_size = (M + N) - d + 1;
-
-                int blockStart = k_start;
-                int blockEnd = min(blockStart + stripe_height, d_size);
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start + d - M - 1, k_start, 
-                        1, 1, 0);
-
-                if (threadIdx.x == 0) prevCol[d - (startN + stripe_height)] = dpBuffers[bufferPrev][blockEnd - 1 - k_start];
-
-                if (k_start > 0) k_start--;
+                diag_start += M + N - d + 1;
             }
         }
     }
     else {
+        // Bands of rows [is, ie]. topRow carries row startM over from the previous band, prevCol is
+        // the column 0 boundary and is only read.
         for (int startM = 0; startM < M; startM += BLOCKSIZE) {
-            startCurr = get_diag_start_device(startM + 1, M, N); // starts at 1
-            startPrev = get_diag_start_device(startM, M, N); // starts at 0
-
             int stripe_height = min(BLOCKSIZE, M - startM);
 
-            int d = 2 + startM; // StartM corresponds exactly to the diagonal where we want to start. This is the reason we start at 2, to offset halo values
+            int is = startM + 1;                // first row owned by the band
+            int ie = startM + stripe_height;    // last row owned by the band
 
-            k_start = 0;
+            __syncthreads();
 
             bufferAct = 2, bufferPrev = 1, bufferPrevPrev = 0;
-            
+
+            // Seed the two diagonals that precede the band: (startM, 0) and (startM, 1) are on the
+            // carry row, (is, 0) is the first cell of the band on the column 0 boundary.
             if (threadIdx.x == 0) {
-                dpBuffers[bufferPrevPrev][0] = dp[startPrev];
-                dpBuffers[bufferPrev][1] = dp[startCurr + 1];
-                dpBuffers[bufferPrev][0] = dp[startCurr];
+                dpBuffers[bufferPrevPrev][stripe_height + 1] = prevCol[startM];
+                dpBuffers[bufferPrev][stripe_height + 1]     = topRow[1];
+                dpBuffers[bufferPrev][stripe_height]         = prevCol[is];
             }
 
             __syncthreads();
 
+            int d = is + 1;                                     // first diagonal that hits the band
+            int diag_start = get_diag_start_device(d, M, N);    // where diagonal d starts in dp
+
             // --------------- Grow phase ------------------
+            // Mirror image of the M >= N case: the band's piece runs from the column 0 boundary
+            // down to the last row of the band, and grows until it covers every row of it.
 
-            for (; d < l_min + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + d;
+            for (; d <= ie; ++d) {
+                int klo = ie + 2 - d;                   // the cell left of it is on column 0
 
-                int d_size = d + 1;
-                int blockStart = k_start + 1;
-                int blockEnd = min(blockStart + stripe_height, d_size - 1);
+                write_base = diag_start + (d - ie - 1); // d <= M, so no column is missing yet
 
                 if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][0] = prevCol[d];
-                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1 - startM];
+                    dpBuffers[bufferAct][klo - 1]           = prevCol[d];          // column 0
+                    dpBuffers[bufferAct][stripe_height + 1] = topRow[d - startM];  // carry row
                 }
-                __syncthreads();
 
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                            k_start - 1, k_start + M - d, 
-                            -1, 0, -1);
+                process_diagonal(klo, stripe_height, d, d - ie - 2, M - ie - 1, 1, 1, 0);
 
-                if (d > (startM + stripe_height)) k_start++;
-
-                if (threadIdx.x == 0 && d > BLOCKSIZE + startM) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                diag_start += d + 1;                    // d <= M < N, the diagonal is still growing
             }
-
 
             // --------------- Stable phase ------------------
-            
-            int d_size = l_min + 1;
-            int blockStart = k_start;
-            int blockEnd = min(blockStart + stripe_height, d_size - 1);
+            // The band is full: the last row is finished on every diagonal and handed over to the
+            // next band. The matrix diagonal itself may still grow, stay or shrink here - that only
+            // shows up in its length and in how many columns it has already lost.
 
-            if (d < l_min + 2)
-            {
-                startPrev = startCurr;
-                startCurr = startCurr + l_min + 1;
+            for (; d <= is + N; ++d) {
+                int j_min = max(0, d - M);              // first column stored on this diagonal
 
-                if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1 - startM];
-                }
+                write_base = diag_start + (d - ie - 1) - j_min;
 
-                __syncthreads();
+                // The carry row stops once the diagonal runs past the end of the query.
+                if (threadIdx.x == 0 && d - startM <= N)
+                    dpBuffers[bufferAct][stripe_height + 1] = topRow[d - startM];
 
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start + d - M - 1, k_start, 
-                        0, 1, 0);
+                process_diagonal(1, stripe_height, d, d - ie - 2, M - ie - 1, 1, 1, 0);
 
-                if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
-                
-                ++d;
-            }
+                if (threadIdx.x == 0) topRow[d - ie] = dpBuffers[bufferPrev][1];
 
-            for (; d < l_max + 2 - 1; ++d) {
-                startPrev = startCurr;
-                startCurr = startCurr + l_min + 1;
-
-                if (threadIdx.x == 0) {
-                    dpBuffers[bufferAct][blockEnd - k_start] = topRow[d - 1 - startM];
-                }
-
-                __syncthreads();
-
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start + d - M - 1, k_start, 
-                        1, 1, 0);
-                
-                if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                diag_start += min(d, N) - j_min + 1;
             }
 
             // --------------- Shrink phase -----------------
+            // The diagonal has run past the last column, so it now leaves the band row by row.
 
-            blockStart = k_start;
+            for (; d <= ie + N; ++d) {
+                int khi = ie + 1 - d + N;               // first row of the band it still reaches
 
-            for (; d < startM + stripe_height + N + 2 - 1; ++d) { 
-                startPrev = startCurr;
-                startCurr = startCurr + (M + N) - d + 2;
+                write_base = diag_start + M - ie - 1;   // = diag_start + (d - ie - 1) - (d - M)
 
-                d_size = (M + N) - d + 1;
-                blockEnd = min(blockStart + stripe_height, d_size);
-                
-                process_stripe_small(blockStart - k_start, blockEnd - k_start, d, 
-                        k_start + d - M - 1, k_start, 
-                        1, 1, 0);
+                process_diagonal(1, khi, d, d - ie - 2, M - ie - 1, 1, 1, 0);
 
-                if (threadIdx.x == 0) topRow[d - (startM + stripe_height)] = dpBuffers[bufferPrev][0];
+                if (threadIdx.x == 0) topRow[d - ie] = dpBuffers[bufferPrev][1];
+
+                diag_start += M + N - d + 1;
             }
         }
     }
-    
     __syncthreads();
 
     // ------------------ Find j of local max ------------------
@@ -585,8 +535,10 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
 
     __syncthreads(); 
 
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (t < stride) {
+    for (unsigned int live = blockDim.x; live > 1; ) {
+        unsigned int stride = (live + 1) / 2;
+
+        if (t + stride < live) {
             int curr_max = local_max_red[t];
             int candidate = local_max_red[t + stride];
             
@@ -599,6 +551,7 @@ __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequenc
             local_max_d_red[t] = is_greater ? candidate_d : curr_d; 
         }
         __syncthreads();
+        live = stride;
     }
 
     local_max = local_max_red[0];
