@@ -1,13 +1,10 @@
-#include "../include/cuda_naive.cuh"
-#include "../include/cuda_parallel_node.cuh"
-#include "../include/cuda_parallel_async.cuh"
-#include "../include/cuda_async_monolithic.cuh"
+#include "../include/hybrid_base.cuh"
 #include "../include/cuda_shared_mem.cuh"
 
-#include "../include/cpu_sequential.h"
-#include "../include/cpu_simd.h"
-#include "../include/cpu_simd_parallel_dp.h"
+#include "../include/definitions.h"
+extern "C" {
 #include "../include/cpu_simd_parallel_node.h"
+}
 
 AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence sequence)
 {
@@ -23,26 +20,147 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
 
     cudaMalloc((void**)&sequence_rev.sequence, sequence.size * sizeof(char));
     cudaMemcpy(sequence_rev.sequence, tmp.sequence, sequence.size * sizeof(char), cudaMemcpyHostToDevice);
-    
-    dim3 gridDim(1);
-    dim3 blockDim(BLOCKSIZE);
+
+    int num_levels = graph.nodes[graph.num_nodes-1].depth + 1;
+    int* nodes_per_level = (int*)calloc(num_levels, sizeof(int));
+
+    for (int n = 0; n < graph.num_nodes; n++) {
+        int depth = graph.nodes[n].depth;
+        nodes_per_level[depth]++;
+    }
+
+    // Last level that still runs on the GPU. Once it is done nothing has to travel back to the
+    // device any more, so the CPU levels after it keep their matrices on the host.
+    int last_gpu_level = -1;
+    for (int d = 0; d < num_levels; d++)
+        if (nodes_per_level[d] >= HYBRID_MIN_NODES) last_gpu_level = d;
+
+    cudaStream_t compute_stream, copy_stream;
+    cudaStreamCreate(&compute_stream);
+    cudaStreamCreate(&copy_stream);
+
+    Node* device_nodes_pointers = (Node*)malloc(graph.num_nodes * sizeof(Node));
+    cudaMemcpy(device_nodes_pointers, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
+
+    Node* device_nodes_tmp = NULL;
+    cudaMallocHost((void**)&device_nodes_tmp, graph.num_nodes * sizeof(Node));
 
     cudaError_t status;
+    Node* act = cudaGraph.nodes;
+    int node_offset = 0;
 
-    for (int n = 0; n < graph.num_nodes; n++)
+    cudaEvent_t compute_done;
+    cudaEventCreate(&compute_done);
+
+    int batch_start_offset = 0;     // node_offset at start of current batch
+    Node* batch_start_act  = act;   // device pointer at start of current batch
+    size_t batch_bytes = 0;         // matrices already queued in this batch
+
+    for (int d = 0; d < num_levels; d++)
     {
-        compute_dp_gpu_naive<<<gridDim, blockDim>>>(&cudaGraph.nodes[n], sequence, sequence_rev);
-        
-        cudaError_t launch_status = cudaGetLastError();
-        if (launch_status != cudaSuccess) {
-            fprintf(stderr, "Kernel Launch Error on node %d: %s\n", n, cudaGetErrorString(launch_status));
+        bool level_on_gpu = (nodes_per_level[d] >= HYBRID_MIN_NODES);
+
+        if (level_on_gpu)
+        {
+            dim3 gridDim(nodes_per_level[d]);
+            dim3 blockDim(BLOCKSIZE);
+
+            int max_node_size = 0;
+            for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++)
+                if (graph.nodes[n].sequence.size > max_node_size) max_node_size = graph.nodes[n].sequence.size;
+
+            int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (max_node_size + sequence.size + 2);
+            dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + max_node_size);
+
+            compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
+
+            cudaError_t launch_status = cudaGetLastError();
+            if (launch_status != cudaSuccess) {
+                fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
+            }
+
+            for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++)
+                batch_bytes += (size_t)(sequence.size + 2) * (graph.nodes[n].sequence.size + 2) * sizeof(DTYPEMATRIX);
+
+            act = &act[nodes_per_level[d]];
+            node_offset += nodes_per_level[d];
         }
 
-        if (graph.nodes[n].depth > graph.nodes[n - 1].depth) {
-            status = cudaDeviceSynchronize();
+        // The batch has to be on the host before the next CPU level reads it, and the levels are
+        // otherwise flushed once they are big enough to be worth a copy command of their own.
+        bool next_level_on_cpu = (d + 1 < num_levels) && (nodes_per_level[d + 1] < HYBRID_MIN_NODES);
+        bool last_level = (d == num_levels - 1);
+
+        if (batch_bytes > 0 && (batch_bytes >= BATCH_BYTES || next_level_on_cpu || last_level))
+        {
+            // one sync point for the whole batch, not one per level
+            cudaEventRecord(compute_done, compute_stream);
+            cudaStreamWaitEvent(copy_stream, compute_done, 0);
+
+            int batch_num_nodes = node_offset - batch_start_offset;
+            size_t batch_nodes_size = (size_t)batch_num_nodes * sizeof(Node);
+
+            cudaMemcpyAsync(&device_nodes_tmp[batch_start_offset],
+                            batch_start_act,
+                            batch_nodes_size,
+                            cudaMemcpyDeviceToHost,
+                            copy_stream);
+
+            cudaMemcpyAsync(graph.nodes[batch_start_offset].dp_matrix,
+                            device_nodes_pointers[batch_start_offset].dp_matrix,
+                            batch_bytes,
+                            cudaMemcpyDeviceToHost,
+                            copy_stream);
+
+            // reset batch trackers
+            batch_start_offset = node_offset;
+            batch_start_act = act;
+            batch_bytes = 0;
+        }
+
+        if (!level_on_gpu)
+        {
+            // Everything this level reads (the last column of each predecessor) has to have landed
+            // on the host already.
+            status = cudaStreamSynchronize(copy_stream);
             if (status != cudaSuccess) {
                 fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
             }
+
+            // Half of these levels hold a single node, and opening a parallel region for one node
+            // costs more than the node does.
+            if (nodes_per_level[d] > 1)
+            {
+                #pragma omp parallel for schedule(dynamic) num_threads(2)
+                for (int t = 0; t < nodes_per_level[d]; t++)
+                {
+                    compute_dp_cpu_simd_parallel_node(&graph.nodes[node_offset + t], sequence);
+                }
+            }
+            else
+            {
+                compute_dp_cpu_simd_parallel_node(&graph.nodes[node_offset], sequence);
+            }
+
+            // Only worth uploading if some later level still runs on the device.
+            if (d < last_gpu_level)
+            {
+                size_t level_bytes = 0;
+                for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++)
+                    level_bytes += (size_t)(sequence.size + 2) * (graph.nodes[n].sequence.size + 2) * sizeof(DTYPEMATRIX);
+
+                cudaMemcpy(device_nodes_pointers[node_offset].dp_matrix,
+                           graph.nodes[node_offset].dp_matrix,
+                           level_bytes,
+                           cudaMemcpyHostToDevice);
+            }
+
+            act = &act[nodes_per_level[d]];
+            node_offset += nodes_per_level[d];
+
+            // the CPU wrote straight into the host matrices, so the batch restarts after it
+            batch_start_offset = node_offset;
+            batch_start_act = act;
         }
     }
 
@@ -51,351 +169,47 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
         fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
     }
 
-    graph.max_score = graph.nodes[0].max_score;
-    graph.max_score_node_id = 0;
-    for (int n = 1; n < graph.num_nodes; n++)
-    {
-        if (graph.nodes[n].max_score > graph.max_score) { 
-            graph.max_score = graph.nodes[n].max_score; 
-            graph.max_score_node_id = n;
+    // The GPU levels wrote their scores into the device node structs, the CPU levels wrote theirs
+    // straight into the host ones, so only the former have to be taken over.
+    node_offset = 0;
+    for (int d = 0; d < num_levels; d++) {
+        if (nodes_per_level[d] >= HYBRID_MIN_NODES) {
+            for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++) {
+                graph.nodes[n].max_score   = device_nodes_tmp[n].max_score;
+                graph.nodes[n].max_score_d = device_nodes_tmp[n].max_score_d;
+                graph.nodes[n].max_score_i = device_nodes_tmp[n].max_score_i;
+                graph.nodes[n].max_score_j = device_nodes_tmp[n].max_score_j;
+            }
         }
+        node_offset += nodes_per_level[d];
     }
 
-    cudaFree(sequence_rev.sequence);
-    free(tmp.sequence);
-
-    Node* device_nodes_scratch = (Node*)malloc(graph.num_nodes * sizeof(Node));
-    cudaMemcpy(device_nodes_scratch, cudaGraph.nodes, graph.num_nodes * sizeof(Node), cudaMemcpyDeviceToHost);
-
-    graph.max_score = device_nodes_scratch[0].max_score;
+    graph.max_score = graph.nodes[0].max_score;
     graph.max_score_node_id = 0;
 
     for (int n = 0; n < graph.num_nodes; n++) {
-        graph.nodes[n].max_score   = device_nodes_scratch[n].max_score;
-        graph.nodes[n].max_score_d = device_nodes_scratch[n].max_score_d;
-        graph.nodes[n].max_score_i = device_nodes_scratch[n].max_score_i;
-        graph.nodes[n].max_score_j = device_nodes_scratch[n].max_score_j;
-        
-        if (device_nodes_scratch[n].max_score > graph.max_score) { 
-            graph.max_score = device_nodes_scratch[n].max_score; 
+        if (graph.nodes[n].max_score > graph.max_score) {
+            graph.max_score = graph.nodes[n].max_score;
             graph.max_score_node_id = n;
         }
-
-        size_t matrix_size = (sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
-        cudaMemcpy(graph.nodes[n].dp_matrix, device_nodes_scratch[n].dp_matrix, 
-                   matrix_size * sizeof(DTYPEMATRIX), cudaMemcpyDeviceToHost);
     }
 
-    // Clean up local tracking structures
-    free(device_nodes_scratch);
+    cudaEventDestroy(compute_done);
+    cudaStreamDestroy(compute_stream);
+    cudaStreamDestroy(copy_stream);
+    free(nodes_per_level);
+    cudaFree(sequence_rev.sequence);
+    free(tmp.sequence);
+    cudaFreeHost(device_nodes_tmp);
+    free(device_nodes_pointers);
 
-    return compute_traceback_gpu_naive(graph, sequence);
+    return compute_traceback_hybrid_base(graph, sequence);
 }
 
-__global__ void worker(Node* nodes, Communicator* comm, Sequence sequence, Sequence sequence_rev)
-{
-    // Sync with CPU via atomics and then wo work 
-    while(!(comm->done[0]))
-    {
-        while (!(comm->job_ready[0]))
-        {
-            //do nothing
-        }
-
-        int n = comm->nodeId[0];
-
-        compute_dp_gpu_naive(&nodes[n], sequence, sequence_rev);
-
-        if (threadIdx.x == 0)
-            comm->job_ready[0] = true;
-    
-    }
-}
-
-__device__ void compute_dp_gpu_naive(Node* node, Sequence sequence, Sequence sequence_rev)
-{
-    // ------------------------------------------------- Initialize -------------------------------------------------
-
-    int M = sequence.size;
-    int N = node->sequence.size;
-    DTYPEMATRIX* __restrict dp = node->dp_matrix;
-    
-    if (node->num_in == 0) {
-        for (int i = threadIdx.x; i <= M; i += blockDim.x) 
-            dp[get_diagonal_index_device(i, 0, M, N)] = 0;
-        
-        for (int j = threadIdx.x + 1; j <= N; j += blockDim.x) 
-            dp[get_diagonal_index_device(0, j, M, N)] = 0;
-    }
-    else if (node->num_in == 1) {
-        DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix;
-        int prev_N = node->v_in[0]->sequence.size;
-
-        for (int i = threadIdx.x; i <= M; i += blockDim.x)
-            dp[get_diagonal_index_device(i, 0, M, N)] = prev_dp[get_diagonal_index_device(i, prev_N, M, prev_N)];
-        
-        for (int j = threadIdx.x + 1; j <= N; j += blockDim.x) 
-            dp[get_diagonal_index_device(0, j, M, N)] = 0;
-    }
-    else {
-        DTYPEMATRIX* prev_dp = node->v_in[0]->dp_matrix; 
-        DTYPEMATRIX* prev_dp2 = node->v_in[1]->dp_matrix; 
-        int prev_N1 = node->v_in[0]->sequence.size;
-        int prev_N2 = node->v_in[1]->sequence.size;
-
-        for (int i = threadIdx.x; i <= M; i += blockDim.x) {
-            int score1 = prev_dp[get_diagonal_index_device(i, prev_N1, M, prev_N1)];
-            int score2 = prev_dp2[get_diagonal_index_device(i, prev_N2, M, prev_N2)];
-            dp[get_diagonal_index_device(i, 0, M, N)] = max(score1, score2);
-        }
-
-        for (int i = 2; i < node->num_in; ++i) {
-            prev_dp = node->v_in[i]->dp_matrix;
-            int prev_Ni = node->v_in[i]->sequence.size;
-            for (int j = threadIdx.x; j <= M; j += blockDim.x) {
-                int act = get_diagonal_index_device(j, 0, M, N);
-                dp[act] = max(prev_dp[get_diagonal_index_device(j, prev_Ni, M, prev_Ni)], dp[act]);
-            }
-        }
-        for (int j = threadIdx.x + 1; j <= N; j += blockDim.x) dp[get_diagonal_index_device(0, j, M, N)] = 0;
-    }
-
-    // ------------------------------------------------- Compute -------------------------------------------------
-    
-    char* __restrict node_seq = node->sequence.sequence;
-    char* __restrict query_seq_rev = sequence_rev.sequence;
-
-    int local_max = -1;
-    int local_max_d = -1;
-    int local_max_j = -1;
-
-    int l_min = (M < N) ? M : N;
-    int l_max = (M > N) ? M : N;
-
-    int startCurr = 1;
-    int startPrev = 0;
-    int startPrevPrev;
-
-    int d = 2;
-
-    // --------------- Grow phase ------------------
-
-    for (; d <= l_min; ++d) {
-        startPrevPrev = startPrev;
-        startPrev = startCurr;
-        startCurr = startCurr + d;
-
-        int prev_max = local_max;
-        int d_size = d - 1;
-
-        for (int k = 1 + threadIdx.x; k <= d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
-            int j = k - 1;
-            int i = M - d + k;
-
-            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-            int diagonal    = dp[startPrevPrev + k - 1] + score;
-            int up          = dp[startPrev + k] + GAP;
-            int left        = dp[startPrev + k - 1] + GAP;
-
-            int res = max(max(diagonal, 0), max(up, left));
-            dp[startCurr + k] = res;
-
-            local_max = max(res, local_max);
-        }
-
-        if (prev_max != local_max)
-        {
-            local_max_d = d;
-        }
-
-        __syncthreads();
-    }
-
-    // --------------- Stable phase ------------------
-
-    if (l_min == N) {
-        for (; d <= l_max; ++d) {
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + N + 1;
-
-            int prev_max = local_max;
-            int d_size = N;
-
-            for (int k = 1 + threadIdx.x; k <= d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
-                int j = k - 1;
-                int i = M - d + k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k - 1] + score;
-                int up          = dp[startPrev + k] + GAP;
-                int left        = dp[startPrev + k - 1] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-        }
-    }
-    else {
-        for (; d <= l_max; ++d) {
-            startPrevPrev = startPrev;
-            startPrev = startCurr;
-            startCurr = startCurr + M + 1;
-
-            int prev_max = local_max;
-            int d_size = M;
-
-            int off_curr = max(0, d - M);
-            int off_up   = max(0, d - 1 - M);
-            int off_diag = max(0, d - 2 - M);
-
-            for (int k = off_curr + threadIdx.x; k < off_curr + d_size; k += blockDim.x) { 
-                int j = k - 1;
-                int i = M - d + k;
-
-                int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-                int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
-                int up          = dp[startPrev + k - off_up] + GAP;
-                int left        = dp[startPrev + k - 1 - off_up] + GAP;
-
-                int res = max(max(diagonal, 0), max(up, left));
-                dp[startCurr + k - off_curr] = res;
-
-                local_max = max(res, local_max);
-            }
-
-            if (prev_max != local_max)
-            {
-                local_max_d = d;
-            }
-
-            __syncthreads();
-        }
-    }
-
-    // --------------- Shrink phase ------------------
-
-    for (; d <= (M+N); ++d) {
-        startPrevPrev = startPrev;
-        startPrev = startCurr;
-        startCurr = startCurr + (M + N) - d + 2;
-
-        int prev_max = local_max;
-        int d_size = (M + N) - d + 1;
-
-        int off_curr = max(0, d - M);
-        int off_up   = max(0, d - 1 - M);
-        int off_diag = max(0, d - 2 - M);
-
-        for (int k = off_curr + threadIdx.x; k < off_curr + d_size; k += blockDim.x) { // TODO: Iterate over every 8 elements and look for local max j after, that way we can do SIMD and keep max j
-            int j = k - 1;
-            int i = M - d + k;
-
-            int score = (node_seq[j] == query_seq_rev[i]) ? MATCH : MISMATCH;
-
-            int diagonal    = dp[startPrevPrev + k - 1 - off_diag] + score;
-            int up          = dp[startPrev + k - off_up] + GAP;
-            int left        = dp[startPrev + k - 1 - off_up] + GAP;
-
-            int res = max(max(diagonal, 0), max(up, left));
-            dp[startCurr + k - off_curr] = res;
-
-            local_max = max(res, local_max);
-        }
-
-        if (prev_max != local_max)
-        {
-            local_max_d = d;
-        }
-
-        __syncthreads();
-    }
-
-    // ------------------ Find j of local max ------------------
-
-    __syncthreads();
-
-    int t = threadIdx.x;
-    __shared__ int local_max_red[BLOCKSIZE];
-    __shared__ int local_max_d_red[BLOCKSIZE];
-
-    local_max_red[t] = local_max;
-    local_max_d_red[t] = local_max_d;
-
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (t < stride) {
-            int curr_max = local_max_red[t];
-            int candidate = local_max_red[t + stride];
-            
-            int curr_d = local_max_d_red[t];
-            int candidate_d = local_max_d_red[t + stride];
-
-            bool is_greater = (candidate > curr_max);
-            
-            local_max_red[t]  = is_greater ? candidate : curr_max;
-            local_max_d_red[t] = is_greater ? candidate_d : curr_d; 
-        }
-        __syncthreads();
-    }
-
-    __syncthreads();
-
-    local_max = local_max_red[0];
-    local_max_d = local_max_d_red[0];
-
-    if (local_max_d != -1) {
-
-        __shared__ int shared_min_j;
-        if (threadIdx.x == 0) {
-            shared_min_j = INT_MAX; 
-        }
-
-        __syncthreads();
-        
-        int final_d = local_max_d;
-        int j_start = (local_max_d - M > 1) ? local_max_d - M : 1;
-        int j_end = (local_max_d - 1 < N) ? local_max_d - 1 : N;
-
-        startCurr = get_diag_start_device(final_d, M, N);
-
-        int off_curr = max(0, final_d - M);
-
-        for (int j = j_start + threadIdx.x; j <= j_end; j += blockDim.x) {
-            if (dp[startCurr + j - off_curr] == local_max) {
-                atomicMin(&shared_min_j, j);
-            }
-        }
-
-        __syncthreads();
-
-        if (threadIdx.x == 0)
-            local_max_j = shared_min_j;
-    }
-
-    if (threadIdx.x == 0) {
-        node->max_score = local_max;
-        node->max_score_d = local_max_d;
-        node->max_score_i = (local_max_d != -1) ? (local_max_d - local_max_j) : -1;
-        node->max_score_j = local_max_j;
-    }
-}
-
-AlignmentResult compute_traceback_gpu_naive(Graph graph, Sequence sequence) {
+AlignmentResult compute_traceback_hybrid_base(Graph graph, Sequence sequence) {
     Node* curr_node = &graph.nodes[graph.max_score_node_id];
-    int i = curr_node->max_score_i; 
-    int j = curr_node->max_score_j; 
+    int i = curr_node->max_score_i;
+    int j = curr_node->max_score_j;
     int M = sequence.size;
 
     int max_graph_seq_len = 0;
@@ -404,7 +218,7 @@ AlignmentResult compute_traceback_gpu_naive(Graph graph, Sequence sequence) {
     }
     char* align_graph = (char*)malloc(M + max_graph_seq_len + 1);
     char* align_query = (char*)malloc(M + max_graph_seq_len + 1);
-    int pos = 0; 
+    int pos = 0;
 
     while (curr_node != NULL) {
         int N = curr_node->sequence.size;
@@ -413,7 +227,7 @@ AlignmentResult compute_traceback_gpu_naive(Graph graph, Sequence sequence) {
 
         if (i > 0 && j > 0) {
             int score = (curr_node->sequence.sequence[j-1] == sequence.sequence[i-1]) ? MATCH : MISMATCH;
-            
+
             int diag_score = curr_node->dp_matrix[get_diagonal_index(i - 1, j - 1, M, N)];
             int up_score   = curr_node->dp_matrix[get_diagonal_index(i - 1, j, M, N)];
             int left_score = curr_node->dp_matrix[get_diagonal_index(i, j - 1, M, N)];
@@ -432,8 +246,8 @@ AlignmentResult compute_traceback_gpu_naive(Graph graph, Sequence sequence) {
                 j--;
             }
             pos++;
-            
-        } else if (j == 0) { 
+
+        } else if (j == 0) {
             if (curr_node->num_in > 0) {
                 Node* best_prev = NULL;
                 for (int p = 0; p < curr_node->num_in; p++) {
@@ -454,7 +268,7 @@ AlignmentResult compute_traceback_gpu_naive(Graph graph, Sequence sequence) {
                 }
                 curr_node = NULL;
             }
-        } else if (i == 0) { 
+        } else if (i == 0) {
             while (j > 0) {
                 align_graph[pos] = curr_node->sequence.sequence[j-1];
                 align_query[pos] = '-';
@@ -463,8 +277,8 @@ AlignmentResult compute_traceback_gpu_naive(Graph graph, Sequence sequence) {
             curr_node = NULL;
         }
     }
-    
-    align_graph[pos] = '\0'; 
+
+    align_graph[pos] = '\0';
     align_query[pos] = '\0';
     reverse_string(align_graph, pos);
     reverse_string(align_query, pos);

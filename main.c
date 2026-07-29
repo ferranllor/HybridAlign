@@ -21,6 +21,9 @@
 #include "include/cuda_async_batching.cuh"
 #include "include/cuda_shared_mem.cuh"
 
+#include "include/hybrid_base.cuh"
+#include "include/hybrid_unified.cuh"
+
 // *************************************************************************************************
 //
 //                                             Utils
@@ -375,11 +378,11 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, " --- Second argument: --- \n");
         fprintf(stderr, "0 = CPU-only\n"); 
         fprintf(stderr, "1 = GPU-only\n"); 
-        fprintf(stderr, "2 = CPU-GPU exec (WIP)\n"); 
+        fprintf(stderr, "2 = CPU-GPU exec (hybrid)\n"); 
         fprintf(stderr, " --- Third argument: --- \n"); 
         fprintf(stderr, "0: 0-3 For CPU-only\n"); 
         fprintf(stderr, "1: 0-5 For GPU-only\n"); 
-        fprintf(stderr, "2: WIP\n"); 
+        fprintf(stderr, "2: 0-1 For hybrid CPU-GPU\n"); 
         return -1; 
     }
 
@@ -438,6 +441,13 @@ int main(int argc, char *argv[]) {
         
         init_gpu_graph(&graph, &cudaGraph, sequence.size);
     }
+    else if (Hybrid) {
+        switch (version){
+            case 0: init_hybrid_graph(&graph, &cudaGraph, sequence.size); break;
+            case 1: init_unified_graph(&graph, &cudaGraph, sequence.size); break;
+            default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
+        }
+    }
     else {
         fprintf(stderr, "Still not implemented!\n"); return -4;
     }
@@ -467,6 +477,14 @@ int main(int argc, char *argv[]) {
             case 5: res = gpu_align_async_batching(graph, cudaGraph, sequence); break;
             case 6: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
+        }
+    }
+    else if (Hybrid)
+    {
+        switch (version){
+            case 0: res = gpu_align_hybrid_base(graph, cudaGraph, sequence); break;
+            case 1: res = gpu_align_hybrid_unified(graph, cudaGraph, sequence); break;
+            default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }
         
@@ -511,6 +529,14 @@ int main(int argc, char *argv[]) {
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }
+        else if (Hybrid)
+        {
+            switch (version){
+                case 0: res = gpu_align_hybrid_base(graph, cudaGraph, sequence); break;
+                case 1: res = gpu_align_hybrid_unified(graph, cudaGraph, sequence); break;
+                default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
+            }
+        }
         TIMER_STOP(0);
 
         free(res.graph_align);
@@ -547,6 +573,13 @@ int main(int argc, char *argv[]) {
         }
         
         free_gpu_graph(&cudaGraph);
+    }
+    else if (Hybrid) {
+        switch (version){
+            case 0: free_hybrid_graph(&graph, &cudaGraph); break;
+            case 1: free_unified_graph(&graph, &cudaGraph); break;
+            default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
+        }
     }
     else {
         fprintf(stderr, "Still not implemented!\n"); return -4;

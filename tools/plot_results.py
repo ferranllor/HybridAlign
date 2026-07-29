@@ -28,14 +28,18 @@ try:
 except ImportError:
     sys.exit("matplotlib is not installed: pip install matplotlib")
 
-# Palette: slots 1 and 2 of the validated categorical set (blue, orange), used verbatim.
-# Two series only, so identity is carried by a legend plus the fixed CPU/GPU grouping.
+# Palette: slots 1-3 of the validated categorical set (blue, orange, aqua), used verbatim - the
+# three slots that clear the all-pairs gates in both modes. Identity is carried by a legend plus the
+# fixed CPU / GPU / hybrid grouping, never by colour alone.
 THEME = {
     "light": dict(surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e", grid="#dedcd6",
-                  cpu="#eb6834", gpu="#2a78d6"),
+                  cpu="#eb6834", gpu="#2a78d6", hybrid="#1baf7a"),
     "dark":  dict(surface="#1a1a19", ink="#ffffff", ink2="#c3c2b7", grid="#3a3a37",
-                  cpu="#d95926", gpu="#3987e5"),
+                  cpu="#d95926", gpu="#3987e5", hybrid="#199e70"),
 }
+
+MODE_NAMES = {0: "CPU", 1: "GPU", 2: "HYB"}
+MODE_COLORS = {0: "cpu", 1: "gpu", 2: "hybrid"}
 
 
 def load(path):
@@ -155,8 +159,8 @@ def main():
                 if not ts:
                     continue
                 mean = sum(ts) / len(ts)
-                labels.append(f"{'CPU' if m == 0 else 'GPU'} {v} {lab}")
-                colors.append(theme["cpu"] if m == 0 else theme["gpu"])
+                labels.append(f"{MODE_NAMES.get(m, m)} {v} {lab}")
+                colors.append(theme[MODE_COLORS.get(m, "gpu")])
                 if kind == "runtime":
                     values.append(mean)
                     lo.append(min(ts))
@@ -183,10 +187,12 @@ def main():
 
             ax.set_title(ds, color=theme["ink"], fontsize=10, loc="left", pad=8)
 
-        handles = [plt.Rectangle((0, 0), 1, 1, color=theme["cpu"]),
-                   plt.Rectangle((0, 0), 1, 1, color=theme["gpu"])]
-        leg = fig.legend(handles, ["CPU", "GPU"], loc="upper right", frameon=False,
-                         ncol=2, fontsize=8, bbox_to_anchor=(0.995, 0.995))
+        modes_present = sorted({m for (m, _, _) in impls})
+        handles = [plt.Rectangle((0, 0), 1, 1, color=theme[MODE_COLORS.get(m, "gpu")])
+                   for m in modes_present]
+        leg = fig.legend(handles, [MODE_NAMES.get(m, str(m)) for m in modes_present],
+                         loc="upper right", frameon=False,
+                         ncol=len(modes_present), fontsize=8, bbox_to_anchor=(0.995, 0.995))
         for text in leg.get_texts():
             text.set_color(theme["ink2"])
 

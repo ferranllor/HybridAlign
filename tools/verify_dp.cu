@@ -11,8 +11,10 @@
 //      same - traceback tie breaks are allowed to differ, scores are not)
 //
 //  Build:  make -C tools            (or: tools/verify.sh, which also sweeps BLOCKSIZE)
-//  Usage:  tools/bin/verify_dp <dataset> <gpu_version> [max_reports] [--csv]
-//          e.g. tools/bin/verify_dp 500_10 6
+//  Usage:  tools/bin/verify_dp <dataset> <mode> <version> [max_reports] [--csv]
+//          mode is the same as bin/main: 1 = GPU only, 2 = hybrid CPU-GPU
+//          e.g. tools/bin/verify_dp 500_10 1 6
+//               tools/bin/verify_dp 500_10 2 0
 //
 //  Exit code is 0 when the GPU matches the CPU, 1 otherwise, so it can be used in a script.
 // ---------------------------------------------------------------------------------------------
@@ -35,6 +37,8 @@ extern "C" {
 #include "cuda_async_monolithic.cuh"
 #include "cuda_async_batching.cuh"
 #include "cuda_shared_mem.cuh"
+#include "hybrid_base.cuh"
+#include "hybrid_unified.cuh"
 
 // ------------------------------------------------------------------ input (mirrors main.c)
 
@@ -171,7 +175,14 @@ static int sort_graph_topologically(Graph* graph) {
 
 // ------------------------------------------------------------------ helpers
 
-static const char* version_name(int v) {
+static const char* version_name(int mode, int v) {
+    if (mode == 2) {
+        switch (v) {
+            case 0: return "hybrid_base";
+            case 1: return "hybrid_unified";
+            default: return "unknown";
+        }
+    }
     switch (v) {
         case 0: case 1: return "naive";
         case 2: return "parallel_node";
@@ -197,17 +208,19 @@ static int alignment_score(const char* g, const char* q) {
 // ------------------------------------------------------------------ main
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <dataset> <gpu_version 0-6> [max_reports] [--csv]\n", argv[0]);
-        fprintf(stderr, "   ex: %s 500_10 6\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <dataset> <mode 1|2> <version> [max_reports] [--csv]\n", argv[0]);
+        fprintf(stderr, "   ex: %s 500_10 1 6   (GPU shared_mem)\n", argv[0]);
+        fprintf(stderr, "       %s 500_10 2 0   (hybrid base)\n", argv[0]);
         return 2;
     }
 
     const char* dataset = argv[1];
-    int gpu_version = atoi(argv[2]);
-    int max_reports = (argc > 3 && argv[3][0] != '-') ? atoi(argv[3]) : 10;
+    int mode = atoi(argv[2]);
+    int gpu_version = atoi(argv[3]);
+    int max_reports = (argc > 4 && argv[4][0] != '-') ? atoi(argv[4]) : 10;
     bool csv = false;
-    for (int a = 3; a < argc; a++) if (!strcmp(argv[a], "--csv")) csv = true;
+    for (int a = 4; a < argc; a++) if (!strcmp(argv[a], "--csv")) csv = true;
 
     char gpath[1024], spath[1024];
     snprintf(gpath, sizeof(gpath), "datasets/graphs/old/%s.graph", dataset);
@@ -230,18 +243,30 @@ int main(int argc, char** argv) {
 
     AlignmentResult rcpu = cpu_align_sequential(gcpu, seq);
 
-    init_cpu_graph_pinned(&ggpu, M);
-    init_gpu_graph(&ggpu, &cudaGraph, M);
-
     AlignmentResult rgpu;
-    switch (gpu_version) {
-        case 0: case 1: rgpu = gpu_align_naive(ggpu, cudaGraph, seq); break;
-        case 2: rgpu = gpu_align_parallel_node(ggpu, cudaGraph, seq); break;
-        case 3: rgpu = gpu_align_parallel_async(ggpu, cudaGraph, seq); break;
-        case 4: rgpu = gpu_align_async_monolithic(ggpu, cudaGraph, seq); break;
-        case 5: rgpu = gpu_align_async_batching(ggpu, cudaGraph, seq); break;
-        case 6: rgpu = gpu_align_shared_mem(ggpu, cudaGraph, seq); break;
-        default: fprintf(stderr, "unknown GPU version %d\n", gpu_version); return 2;
+
+    if (mode == 2) {
+        if (gpu_version == 1) init_unified_graph(&ggpu, &cudaGraph, M);
+        else                  init_hybrid_graph(&ggpu, &cudaGraph, M);
+
+        switch (gpu_version) {
+            case 0: rgpu = gpu_align_hybrid_base(ggpu, cudaGraph, seq); break;
+            case 1: rgpu = gpu_align_hybrid_unified(ggpu, cudaGraph, seq); break;
+            default: fprintf(stderr, "unknown hybrid version %d\n", gpu_version); return 2;
+        }
+    } else {
+        init_cpu_graph_pinned(&ggpu, M);
+        init_gpu_graph(&ggpu, &cudaGraph, M);
+
+        switch (gpu_version) {
+            case 0: case 1: rgpu = gpu_align_naive(ggpu, cudaGraph, seq); break;
+            case 2: rgpu = gpu_align_parallel_node(ggpu, cudaGraph, seq); break;
+            case 3: rgpu = gpu_align_parallel_async(ggpu, cudaGraph, seq); break;
+            case 4: rgpu = gpu_align_async_monolithic(ggpu, cudaGraph, seq); break;
+            case 5: rgpu = gpu_align_async_batching(ggpu, cudaGraph, seq); break;
+            case 6: rgpu = gpu_align_shared_mem(ggpu, cudaGraph, seq); break;
+            default: fprintf(stderr, "unknown GPU version %d\n", gpu_version); return 2;
+        }
     }
 
     // ---------------- DP matrices, cell by cell ----------------
@@ -296,15 +321,15 @@ int main(int argc, char** argv) {
     bool ok = (bad_cells == 0 && bad_scores == 0 && cpu_score == gpu_score);
 
     if (csv) {
-        // dataset,version,name,blocksize,nodes,M,bad_nodes,bad_cells,bad_max_scores,
+        // dataset,mode,version,name,blocksize,nodes,M,bad_nodes,bad_cells,bad_max_scores,
         // cpu_len,gpu_len,cpu_score,gpu_score,identical_alignment,ok
-        printf("%s,%d,%s,%d,%d,%d,%lld,%lld,%lld,%d,%d,%d,%d,%d,%d\n",
-               dataset, gpu_version, version_name(gpu_version), BLOCKSIZE,
+        printf("%s,%d,%d,%s,%d,%d,%d,%lld,%lld,%lld,%d,%d,%d,%d,%d,%d\n",
+               dataset, mode, gpu_version, version_name(mode, gpu_version), BLOCKSIZE,
                gcpu.num_nodes, M, bad_nodes, bad_cells, bad_scores,
                rcpu.size, rgpu.size, cpu_score, gpu_score, same_align ? 1 : 0, ok ? 1 : 0);
     } else {
-        printf("dataset=%s version=%d (%s) nodes=%d M=%d BLOCKSIZE=%d\n",
-               dataset, gpu_version, version_name(gpu_version), gcpu.num_nodes, M, BLOCKSIZE);
+        printf("dataset=%s mode=%d version=%d (%s) nodes=%d M=%d BLOCKSIZE=%d\n",
+               dataset, mode, gpu_version, version_name(mode, gpu_version), gcpu.num_nodes, M, BLOCKSIZE);
         printf("DP mismatches : %lld / %d nodes, %lld cells\n", bad_nodes, gcpu.num_nodes, bad_cells);
         printf("  by shape    : N<M %lld/%lld | N==M %lld/%lld | N>M %lld/%lld\n",
                bad_class[0], tot_class[0], bad_class[1], tot_class[1], bad_class[2], tot_class[2]);

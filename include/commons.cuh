@@ -194,7 +194,7 @@ int init_cpu_graph_pinned(Graph* graph, int seqSize)
     return 0;
 }
 
-int free_cpu_graph_pinned(Graph* graph) 
+int free_cpu_graph_pinned(Graph* graph)
 {
     cudaFreeHost(graph->nodes[0].dp_matrix); // original adress of the buffer containing all dp matrices
 
@@ -207,7 +207,133 @@ int free_cpu_graph_pinned(Graph* graph)
 
     return 0;
 }
-    
+
+int init_hybrid_graph(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    // A hybrid run needs both sides at once: the pinned host matrices the CPU levels write into and
+    // the device matrices the GPU levels write into, laid out identically (same node order, same
+    // padding), so moving a level across is one copy of a contiguous range.
+    int status = init_cpu_graph_pinned(graph, seqSize);
+    if (status != 0) return status;
+
+    return init_gpu_graph(graph, cudaGraph, seqSize);
+}
+
+int free_hybrid_graph(Graph* graph, Graph* cudaGraph)
+{
+    free_gpu_graph(cudaGraph);
+
+    return free_cpu_graph_pinned(graph);
+}
+
+int init_unified_graph(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    cudaError_t cudaStatus;
+
+    // One graph for both sides. The node array, the sequences and the matrices are all managed, so
+    // the CPU levels and the kernels work on the very same structs: there is no host copy and no
+    // device copy to keep in sync, which is the whole point on a machine where both processors sit
+    // behind the same memory.
+    Node* unified_nodes = NULL;
+    cudaStatus = cudaMallocManaged((void**)&unified_nodes, graph->num_nodes * sizeof(Node), cudaMemAttachGlobal);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "unified nodes allocation failed!\n"); return -2; }
+
+    size_t num_elems = 0;
+
+    for (int n = 0; n < graph->num_nodes; n++)
+        num_elems += graph->nodes[n].sequence.size + 2;
+
+    num_elems *= (seqSize + 2);
+
+    DTYPEMATRIX* dpmatrices = NULL;
+
+    cudaStatus = cudaMallocManaged((void**)&dpmatrices, num_elems * sizeof(DTYPEMATRIX), cudaMemAttachGlobal);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "dp_matrix allocation failed!\n"); return -2; }
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* u_node = &unified_nodes[n];
+
+        u_node->id = h_node->id;
+        u_node->depth = h_node->depth;
+        u_node->num_in = h_node->num_in;
+        u_node->num_out = h_node->num_out;
+
+        u_node->dp_matrix = dpmatrices;
+
+        size_t matrix_size = (seqSize + 2) * (h_node->sequence.size + 2);
+        dpmatrices = &dpmatrices[matrix_size];
+
+        u_node->sequence.size = h_node->sequence.size;
+        cudaStatus = cudaMallocManaged((void**)&u_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET), cudaMemAttachGlobal);
+        if (cudaStatus != cudaSuccess) { fprintf(stderr, "sequence allocation failed!\n"); return -2; }
+
+        memcpy(u_node->sequence.sequence, h_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET));
+
+        if (h_node->num_in > 0) {
+            cudaStatus = cudaMallocManaged((void**)&u_node->v_in, h_node->num_in * sizeof(Node*), cudaMemAttachGlobal);
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            u_node->v_in = NULL;
+        }
+
+        if (h_node->num_out > 0) {
+            cudaStatus = cudaMallocManaged((void**)&u_node->v_out, h_node->num_out * sizeof(Node*), cudaMemAttachGlobal);
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            u_node->v_out = NULL;
+        }
+    }
+
+    // Neighbours point into the unified array itself, so the same pointer is valid on both sides.
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* u_node = &unified_nodes[n];
+
+        for (int i = 0; i < h_node->num_in; i++)
+            u_node->v_in[i] = &unified_nodes[h_node->v_in[i]->id];
+
+        for (int i = 0; i < h_node->num_out; i++)
+            u_node->v_out[i] = &unified_nodes[h_node->v_out[i]->id];
+    }
+
+    // The graph read from the file is replaced by the unified one, and the device graph *is* it.
+    for (int n = 0; n < graph->num_nodes; n++) {
+        free(graph->nodes[n].sequence.sequence);
+        free(graph->nodes[n].v_in);
+        free(graph->nodes[n].v_out);
+    }
+    free(graph->nodes);
+
+    graph->nodes = unified_nodes;
+
+    cudaGraph->nodes = unified_nodes;
+    cudaGraph->num_nodes = graph->num_nodes;
+    cudaGraph->max_score = graph->max_score;
+    cudaGraph->max_score_node_id = graph->max_score_node_id;
+
+    return 0;
+}
+
+int free_unified_graph(Graph* graph, Graph* cudaGraph)
+{
+    cudaFree(graph->nodes[0].dp_matrix); // original adress of the buffer containing all dp matrices
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        cudaFree(graph->nodes[n].sequence.sequence);
+        cudaFree(graph->nodes[n].v_in);
+        cudaFree(graph->nodes[n].v_out);
+    }
+
+    cudaFree(graph->nodes);
+
+    graph->nodes = NULL;
+    cudaGraph->nodes = NULL;
+    cudaGraph->num_nodes = 0;
+
+    return 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

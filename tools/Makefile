@@ -24,9 +24,9 @@ OBJ_DIR = obj
 BIN_DIR = bin
 
 CU_SRC  = cuda_naive cuda_parallel_node cuda_parallel_async cuda_async_monolithic \
-          cuda_async_batching cuda_shared_mem
+          cuda_async_batching cuda_shared_mem hybrid_base hybrid_unified
 CU_OBJ  = $(patsubst %,$(OBJ_DIR)/%.o,$(CU_SRC))
-C_OBJ   = $(OBJ_DIR)/cpu_sequential.o
+C_OBJ   = $(OBJ_DIR)/cpu_sequential.o $(OBJ_DIR)/cpu_simd_parallel_node.o
 
 all: $(BIN_DIR)/verify_dp
 
@@ -34,7 +34,7 @@ $(OBJ_DIR)/%.o: $(ROOT)/src/%.cu
 	@mkdir -p $(OBJ_DIR)
 	$(CCNV) -c $< -o $@ $(FLAGS) $(INCLUDES)
 
-$(OBJ_DIR)/cpu_sequential.o: $(ROOT)/src/cpu_sequential.c
+$(OBJ_DIR)/%.o: $(ROOT)/src/%.c
 	@mkdir -p $(OBJ_DIR)
 	gcc -c $< -o $@ -lm -Ofast -finline-functions -fopenmp $(INCLUDES)
 

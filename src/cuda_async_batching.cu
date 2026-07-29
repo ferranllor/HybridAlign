@@ -1,4 +1,5 @@
 #include "../include/cuda_async_batching.cuh"
+#include "../include/hybrid_utils.cuh" // BATCH_BYTES
 
 AlignmentResult gpu_align_async_batching(Graph graph, Graph cudaGraph, Sequence sequence)
 {
@@ -40,10 +41,14 @@ AlignmentResult gpu_align_async_batching(Graph graph, Graph cudaGraph, Sequence 
     cudaEvent_t compute_done;
     cudaEventCreate(&compute_done);
 
-    const int BATCH_LEVELS = 8; // smaller = more overlap, larger = fewer commands
+    // Levels are grouped by how many bytes they produce, not by how many of them there are: the
+    // first levels are the widest ones, so a fixed level count puts most of the graph in the very
+    // first copy command and nothing can be read back until all of it has landed. Bounding the
+    // batch by size keeps the command count low on the long tail of tiny levels while still letting
+    // the big ones leave one at a time.
     int batch_start_offset = 0;   // node_offset at start of current batch
     Node* batch_start_act  = act; // device pointer at start of current batch
-    int levels_in_batch = 0;
+    size_t batch_bytes = 0;       // matrices already queued in this batch
 
     for (int d = 0; d < num_levels; d++)
     {
@@ -57,14 +62,17 @@ AlignmentResult gpu_align_async_batching(Graph graph, Graph cudaGraph, Sequence 
             fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
         }
 
+        for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++) {
+            batch_bytes += (size_t)(sequence.size + 2) * (graph.nodes[n].sequence.size + 2) * sizeof(DTYPEMATRIX);
+        }
+
         act = &act[nodes_per_level[d]];
         node_offset += nodes_per_level[d];
-        levels_in_batch++;
 
         bool last_level = (d == num_levels - 1);
-        bool batch_full = (levels_in_batch >= BATCH_LEVELS);
+        bool batch_full = (batch_bytes >= BATCH_BYTES);
 
-        if (batch_full || last_level) {
+        if (batch_bytes > 0 && (batch_full || last_level)) {
             cudaEventRecord(compute_done, compute_stream);
             cudaStreamWaitEvent(copy_stream, compute_done, 0);
 
@@ -77,22 +85,15 @@ AlignmentResult gpu_align_async_batching(Graph graph, Graph cudaGraph, Sequence 
                             cudaMemcpyDeviceToHost,
                             copy_stream);
 
-            size_t batch_matrix_elements = 0;
-            for (int n = batch_start_offset; n < node_offset; n++) {
-                batch_matrix_elements += (size_t)(sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
-            }
-
-            if (batch_matrix_elements > 0) {
-                cudaMemcpyAsync(graph.nodes[batch_start_offset].dp_matrix,
-                                device_nodes_pointers[batch_start_offset].dp_matrix,
-                                batch_matrix_elements * sizeof(DTYPEMATRIX),
-                                cudaMemcpyDeviceToHost,
-                                copy_stream);
-            }
+            cudaMemcpyAsync(graph.nodes[batch_start_offset].dp_matrix,
+                            device_nodes_pointers[batch_start_offset].dp_matrix,
+                            batch_bytes,
+                            cudaMemcpyDeviceToHost,
+                            copy_stream);
 
             batch_start_offset = node_offset;
             batch_start_act = act;
-            levels_in_batch = 0;
+            batch_bytes = 0;
         }
     }
 
