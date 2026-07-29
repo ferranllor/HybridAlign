@@ -23,6 +23,7 @@
 
 #include "include/hybrid_base.cuh"
 #include "include/hybrid_unified.cuh"
+#include "include/hybrid_pinned.cuh"
 
 // *************************************************************************************************
 //
@@ -382,7 +383,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, " --- Third argument: --- \n"); 
         fprintf(stderr, "0: 0-3 For CPU-only\n"); 
         fprintf(stderr, "1: 0-5 For GPU-only\n"); 
-        fprintf(stderr, "2: 0-1 For hybrid CPU-GPU\n"); 
+        fprintf(stderr, "2: 0-3 For hybrid CPU-GPU\n"); 
         return -1; 
     }
 
@@ -445,6 +446,8 @@ int main(int argc, char *argv[]) {
         switch (version){
             case 0: init_hybrid_graph(&graph, &cudaGraph, sequence.size); break;
             case 1: init_unified_graph(&graph, &cudaGraph, sequence.size); break;
+            case 2: init_pinned_graph(&graph, &cudaGraph, sequence.size); break;
+            case 3: init_advised_graph(&graph, &cudaGraph, sequence.size); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }
@@ -484,6 +487,8 @@ int main(int argc, char *argv[]) {
         switch (version){
             case 0: res = gpu_align_hybrid_base(graph, cudaGraph, sequence); break;
             case 1: res = gpu_align_hybrid_unified(graph, cudaGraph, sequence); break;
+            case 2: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
+            case 3: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }
@@ -534,6 +539,8 @@ int main(int argc, char *argv[]) {
             switch (version){
                 case 0: res = gpu_align_hybrid_base(graph, cudaGraph, sequence); break;
                 case 1: res = gpu_align_hybrid_unified(graph, cudaGraph, sequence); break;
+                case 2: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
+                case 3: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
             }
         }
@@ -578,6 +585,8 @@ int main(int argc, char *argv[]) {
         switch (version){
             case 0: free_hybrid_graph(&graph, &cudaGraph); break;
             case 1: free_unified_graph(&graph, &cudaGraph); break;
+            case 2: free_pinned_graph(&graph, &cudaGraph); break;
+            case 3: free_advised_graph(&graph, &cudaGraph); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }

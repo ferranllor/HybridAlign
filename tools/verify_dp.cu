@@ -39,6 +39,7 @@ extern "C" {
 #include "cuda_shared_mem.cuh"
 #include "hybrid_base.cuh"
 #include "hybrid_unified.cuh"
+#include "hybrid_pinned.cuh"
 
 // ------------------------------------------------------------------ input (mirrors main.c)
 
@@ -180,6 +181,8 @@ static const char* version_name(int mode, int v) {
         switch (v) {
             case 0: return "hybrid_base";
             case 1: return "hybrid_unified";
+            case 2: return "hybrid_pinned";
+            case 3: return "hybrid_advised";
             default: return "unknown";
         }
     }
@@ -246,12 +249,18 @@ int main(int argc, char** argv) {
     AlignmentResult rgpu;
 
     if (mode == 2) {
-        if (gpu_version == 1) init_unified_graph(&ggpu, &cudaGraph, M);
-        else                  init_hybrid_graph(&ggpu, &cudaGraph, M);
+        switch (gpu_version) {
+            case 0: init_hybrid_graph(&ggpu, &cudaGraph, M); break;
+            case 1: init_unified_graph(&ggpu, &cudaGraph, M); break;
+            case 2: init_pinned_graph(&ggpu, &cudaGraph, M); break;
+            case 3: init_advised_graph(&ggpu, &cudaGraph, M); break;
+            default: fprintf(stderr, "unknown hybrid version %d\n", gpu_version); return 2;
+        }
 
         switch (gpu_version) {
             case 0: rgpu = gpu_align_hybrid_base(ggpu, cudaGraph, seq); break;
             case 1: rgpu = gpu_align_hybrid_unified(ggpu, cudaGraph, seq); break;
+            case 2: case 3: rgpu = gpu_align_hybrid_pinned(ggpu, cudaGraph, seq); break;
             default: fprintf(stderr, "unknown hybrid version %d\n", gpu_version); return 2;
         }
     } else {

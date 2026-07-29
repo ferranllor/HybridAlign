@@ -24,11 +24,11 @@ OBJ_DIR = obj
 BIN_DIR = bin
 
 CU_SRC  = cuda_naive cuda_parallel_node cuda_parallel_async cuda_async_monolithic \
-          cuda_async_batching cuda_shared_mem hybrid_base hybrid_unified
+          cuda_async_batching cuda_shared_mem hybrid_base hybrid_unified hybrid_pinned
 CU_OBJ  = $(patsubst %,$(OBJ_DIR)/%.o,$(CU_SRC))
 C_OBJ   = $(OBJ_DIR)/cpu_sequential.o $(OBJ_DIR)/cpu_simd_parallel_node.o
 
-all: $(BIN_DIR)/verify_dp
+all: $(BIN_DIR)/verify_dp $(BIN_DIR)/spark_probe
 
 $(OBJ_DIR)/%.o: $(ROOT)/src/%.cu
 	@mkdir -p $(OBJ_DIR)
@@ -42,7 +42,14 @@ $(BIN_DIR)/verify_dp: verify_dp.cu $(CU_OBJ) $(C_OBJ)
 	@mkdir -p $(BIN_DIR)
 	$(CCNV) $^ -o $@ $(FLAGS) $(INCLUDES)
 
+# standalone: characterises the machine (memory kinds, hand over cost, per level overheads)
+$(BIN_DIR)/spark_probe: spark_probe.cu
+	@mkdir -p $(BIN_DIR)
+	$(CCNV) $< -o $@ $(FLAGS) $(INCLUDES)
+
+spark_probe: $(BIN_DIR)/spark_probe
+
 clean:
 	rm -rf $(OBJ_DIR) $(BIN_DIR)
 
-.PHONY: all clean
+.PHONY: all clean spark_probe

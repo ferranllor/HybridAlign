@@ -16,3 +16,5 @@ outputs/*
 src/unused
 tools/bin/*
 tools/obj/*
+include/cuda_async_registers.cuh
+src/cuda_registers.cu

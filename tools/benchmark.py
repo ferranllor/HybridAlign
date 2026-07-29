@@ -25,7 +25,8 @@ import sys
 CPU_LABELS = {0: "sequential", 1: "simd", 2: "simd_parallel_dp", 3: "simd_parallel_node"}
 GPU_LABELS = {0: "naive", 1: "naive(pinned)", 2: "parallel_node", 3: "parallel_async",
               4: "async_monolithic", 5: "async_batching", 6: "shared_mem"}
-HYBRID_LABELS = {0: "hybrid_base", 1: "hybrid_unified"}
+HYBRID_LABELS = {0: "hybrid_base", 1: "hybrid_unified", 2: "hybrid_pinned",
+                 3: "hybrid_advised"}
 
 ITER_RE = re.compile(r"Iteration\s+(-?\d+)\s+took\s+([0-9.eE+-]+)s")
 LEN_RE = re.compile(r"Alignment Length:\s*(\d+)")
@@ -67,7 +68,7 @@ def main():
                     help="CPU versions to run (mode 0), empty to skip")
     ap.add_argument("-g", "--gpu", nargs="*", type=int, default=[0, 2, 3, 4, 5, 6],
                     help="GPU versions to run (mode 1), empty to skip")
-    ap.add_argument("--hybrid", nargs="*", type=int, default=[0, 1],
+    ap.add_argument("--hybrid", nargs="*", type=int, default=[0, 1, 2, 3],
                     help="hybrid versions to run (mode 2), empty to skip")
     ap.add_argument("-o", "--out", default="outputs/timings.csv")
     ap.add_argument("-t", "--timeout", type=int, default=3600)

@@ -10,6 +10,12 @@
 #define HYBRID_MIN_NODES 8
 #endif
 
+// Threads used for a CPU level. A level that goes to the CPU has fewer than HYBRID_MIN_NODES nodes
+// and every node is one task, so more threads than that can only add barrier traffic.
+#ifndef HYBRID_CPU_THREADS
+#define HYBRID_CPU_THREADS HYBRID_MIN_NODES
+#endif
+
 // Levels are grouped into one copy command until their matrices reach this many bytes. Keeping the
 // batches bounded in size (instead of in number of levels) is what lets the first results come back
 // early: the first levels are the widest ones, so a fixed level count puts most of the graph in the
