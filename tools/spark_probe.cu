@@ -54,6 +54,22 @@ __global__ void read_kernel(const int* p, size_t n, int* sink) {
     if (acc == 0x7fffffff) *sink = acc;   // never true, keeps the loads alive
 }
 
+// Reads one element per 2 MB page, in a scrambled order: streaming bandwidth is blind to how the
+// pages are mapped, this is not. If a memory kind is fine when walked sequentially but slow here,
+// the difference is address translation (page size / TLB reach), not bandwidth.
+__global__ void strided_read_kernel(const int* p, size_t n, size_t stride, int* sink) {
+    size_t tid = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    size_t pages = n / stride;
+    if (pages == 0) return;
+
+    int acc = 0;
+    for (size_t s = 0; s < pages; s++) {
+        size_t page = (tid + s * 7919) % pages;
+        acc += p[page * stride + (tid % 32)];
+    }
+    if (acc == 0x7fffffff) *sink = acc;
+}
+
 __global__ void empty_kernel() {}
 
 // ------------------------------------------------------------------ helpers
@@ -245,6 +261,40 @@ int main(void) {
         stats(t, REPS, &m, &sd, &mn, &mx);
         printf("%-14s %10.3f %10.3f %10.3f %10.3f\n", mem_name[k], m, sd, mn, mx);
         printf("PROBE_CSV,pingpong,%s,%.3f,%.3f,%.3f,%.3f\n", mem_name[k], m, sd, mn, mx);
+
+        free_kind(kind, p);
+    }
+
+    // ---------------------------------------------------------------- scattered access
+    // The DP kernel does not only stream: initialising a node reads the last column of every
+    // predecessor, one element per matrix, so it touches many pages for very little data.
+    printf("\n--- scattered read: one element per 2 MB page over %zu MB (ms, mean +- sd) ---\n", BUF_MB);
+    printf("%-14s %10s %10s %10s %10s\n", "memory", "mean", "sd", "min", "max");
+
+    const size_t STRIDE = 2ull * 1024 * 1024 / sizeof(int);
+    for (int k = 0; k < MEM_COUNT; k++) {
+        MemKind kind = (MemKind)k;
+        if (kind == MEM_PAGEABLE && !prop.pageableMemoryAccess) continue;
+
+        int* p = alloc_kind(kind, bytes);
+        if (!p) continue;
+
+        // touch it once so the measurement is not the first population
+        write_kernel<<<blocks, 256>>>(p, N_ELEMS, 1);
+        CHECK(cudaDeviceSynchronize());
+
+        double t[REPS];
+        for (int r = 0; r < REPS; r++) {
+            double t0 = now_ms();
+            strided_read_kernel<<<blocks, 256>>>(p, N_ELEMS, STRIDE, sink);
+            CHECK(cudaDeviceSynchronize());
+            t[r] = now_ms() - t0;
+        }
+
+        double m, sd, mn, mx;
+        stats(t, REPS, &m, &sd, &mn, &mx);
+        printf("%-14s %10.3f %10.3f %10.3f %10.3f\n", mem_name[k], m, sd, mn, mx);
+        printf("PROBE_CSV,scattered,%s,%.3f,%.3f,%.3f,%.3f\n", mem_name[k], m, sd, mn, mx);
 
         free_kind(kind, p);
     }

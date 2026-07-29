@@ -27,6 +27,8 @@ GPU_LABELS = {0: "naive", 1: "naive(pinned)", 2: "parallel_node", 3: "parallel_a
               4: "async_monolithic", 5: "async_batching", 6: "shared_mem"}
 HYBRID_LABELS = {0: "hybrid_base", 1: "hybrid_unified", 2: "hybrid_pinned",
                  3: "hybrid_advised"}
+NOCOPY_LABELS = {0: "nc_naive", 1: "nc_naive", 2: "nc_level", 3: "nc_level", 4: "nc_level",
+                 5: "nc_level", 6: "nc_shared_mem"}
 
 ITER_RE = re.compile(r"Iteration\s+(-?\d+)\s+took\s+([0-9.eE+-]+)s")
 LEN_RE = re.compile(r"Alignment Length:\s*(\d+)")
@@ -70,6 +72,8 @@ def main():
                     help="GPU versions to run (mode 1), empty to skip")
     ap.add_argument("--hybrid", nargs="*", type=int, default=[0, 1, 2, 3],
                     help="hybrid versions to run (mode 2), empty to skip")
+    ap.add_argument("--nocopy", nargs="*", type=int, default=[0, 2, 6],
+                    help="no-copy GPU versions to run (mode 3), empty to skip")
     ap.add_argument("-o", "--out", default="outputs/timings.csv")
     ap.add_argument("-t", "--timeout", type=int, default=3600)
     args = ap.parse_args()
@@ -84,7 +88,8 @@ def main():
     rows = []
     jobs = [(0, v, CPU_LABELS.get(v, str(v))) for v in args.cpu] + \
            [(1, v, GPU_LABELS.get(v, str(v))) for v in args.gpu] + \
-           [(2, v, HYBRID_LABELS.get(v, str(v))) for v in args.hybrid]
+           [(2, v, HYBRID_LABELS.get(v, str(v))) for v in args.hybrid] + \
+           [(3, v, NOCOPY_LABELS.get(v, str(v))) for v in args.nocopy]
 
     for dataset in args.datasets:
         for mode, version, label in jobs:

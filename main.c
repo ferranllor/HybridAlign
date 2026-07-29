@@ -25,6 +25,8 @@
 #include "include/hybrid_unified.cuh"
 #include "include/hybrid_pinned.cuh"
 
+#include "include/cuda_no_copy.cuh"
+
 // *************************************************************************************************
 //
 //                                             Utils
@@ -380,10 +382,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "0 = CPU-only\n"); 
         fprintf(stderr, "1 = GPU-only\n"); 
         fprintf(stderr, "2 = CPU-GPU exec (hybrid)\n"); 
+    fprintf(stderr, "3 = GPU-only on a shared graph, no copies (SHARED_MEM_KIND=advised|pinned|managed)\n"); 
         fprintf(stderr, " --- Third argument: --- \n"); 
         fprintf(stderr, "0: 0-3 For CPU-only\n"); 
         fprintf(stderr, "1: 0-5 For GPU-only\n"); 
         fprintf(stderr, "2: 0-3 For hybrid CPU-GPU\n"); 
+    fprintf(stderr, "3: 0-6 Same versions as GPU-only, without the copies\n"); 
         return -1; 
     }
 
@@ -424,6 +428,7 @@ int main(int argc, char *argv[]) {
     bool CPU = (mode == 0);
     bool GPU = (mode == 1);
     bool Hybrid = (mode == 2);
+    bool NoCopy = (mode == 3);
 
     if (CPU) {
         init_cpu_graph(&graph, sequence.size);
@@ -450,6 +455,11 @@ int main(int argc, char *argv[]) {
             case 3: init_advised_graph(&graph, &cudaGraph, sequence.size); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
+    }
+    else if (NoCopy) {
+        if (version < 0 || version > 6) { fprintf(stderr, "Unspecified No-copy version!\n"); return -4; }
+
+        init_shared_graph(&graph, &cudaGraph, sequence.size);
     }
     else {
         fprintf(stderr, "Still not implemented!\n"); return -4;
@@ -490,6 +500,15 @@ int main(int argc, char *argv[]) {
             case 2: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
             case 3: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
+        }
+    }
+    else if (NoCopy)
+    {
+        switch (version){
+            case 0: case 1: res = gpu_align_no_copy_naive(graph, cudaGraph, sequence); break;
+            case 2: case 3: case 4: case 5: res = gpu_align_no_copy_level(graph, cudaGraph, sequence); break;
+            case 6: res = gpu_align_no_copy_shared_mem(graph, cudaGraph, sequence); break;
+            default: fprintf(stderr, "Unspecified No-copy version!\n"); return -4;
         }
     }
         
@@ -544,6 +563,15 @@ int main(int argc, char *argv[]) {
                 default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
             }
         }
+        else if (NoCopy)
+        {
+            switch (version){
+                case 0: case 1: res = gpu_align_no_copy_naive(graph, cudaGraph, sequence); break;
+                case 2: case 3: case 4: case 5: res = gpu_align_no_copy_level(graph, cudaGraph, sequence); break;
+                case 6: res = gpu_align_no_copy_shared_mem(graph, cudaGraph, sequence); break;
+                default: fprintf(stderr, "Unspecified No-copy version!\n"); return -4;
+            }
+        }
         TIMER_STOP(0);
 
         free(res.graph_align);
@@ -589,6 +617,9 @@ int main(int argc, char *argv[]) {
             case 3: free_advised_graph(&graph, &cudaGraph); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
+    }
+    else if (NoCopy) {
+        free_shared_graph(&graph, &cudaGraph);
     }
     else {
         fprintf(stderr, "Still not implemented!\n"); return -4;

@@ -494,6 +494,37 @@ int free_advised_graph(Graph* graph, Graph* cudaGraph)
     return free_unified_graph(graph, cudaGraph);
 }
 
+// One shared graph for the GPU only versions of mode 3. Which allocator is behind it is chosen at
+// run time, because the answer is a property of the machine and not of the algorithm:
+//
+//   SHARED_MEM_KIND=advised   managed + preferred location host + accessed by device  (default)
+//   SHARED_MEM_KIND=pinned    cudaMallocHost, the pages are page locked and never move
+//   SHARED_MEM_KIND=managed   plain cudaMallocManaged, the driver migrates as it sees fit
+//
+// The name is printed once so a log always says which one produced the numbers.
+int init_shared_graph(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    const char* kind = getenv("SHARED_MEM_KIND");
+    if (kind == NULL) kind = "advised";
+
+    fprintf(stdout, "Shared graph allocated with SHARED_MEM_KIND=%s\n", kind);
+
+    if (strcmp(kind, "pinned") == 0)  return init_pinned_graph(graph, cudaGraph, seqSize);
+    if (strcmp(kind, "managed") == 0) return init_unified_graph(graph, cudaGraph, seqSize);
+
+    return init_advised_graph(graph, cudaGraph, seqSize);
+}
+
+int free_shared_graph(Graph* graph, Graph* cudaGraph)
+{
+    const char* kind = getenv("SHARED_MEM_KIND");
+    if (kind == NULL) kind = "advised";
+
+    if (strcmp(kind, "pinned") == 0) return free_pinned_graph(graph, cudaGraph);
+
+    return free_unified_graph(graph, cudaGraph);
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -40,6 +40,7 @@ extern "C" {
 #include "hybrid_base.cuh"
 #include "hybrid_unified.cuh"
 #include "hybrid_pinned.cuh"
+#include "cuda_no_copy.cuh"
 
 // ------------------------------------------------------------------ input (mirrors main.c)
 
@@ -177,6 +178,14 @@ static int sort_graph_topologically(Graph* graph) {
 // ------------------------------------------------------------------ helpers
 
 static const char* version_name(int mode, int v) {
+    if (mode == 3) {
+        switch (v) {
+            case 0: case 1: return "no_copy_naive";
+            case 2: case 3: case 4: case 5: return "no_copy_level";
+            case 6: return "no_copy_shared_mem";
+            default: return "unknown";
+        }
+    }
     if (mode == 2) {
         switch (v) {
             case 0: return "hybrid_base";
@@ -212,7 +221,7 @@ static int alignment_score(const char* g, const char* q) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <dataset> <mode 1|2> <version> [max_reports] [--csv]\n", argv[0]);
+        fprintf(stderr, "usage: %s <dataset> <mode 1|2|3> <version> [max_reports] [--csv]\n", argv[0]);
         fprintf(stderr, "   ex: %s 500_10 1 6   (GPU shared_mem)\n", argv[0]);
         fprintf(stderr, "       %s 500_10 2 0   (hybrid base)\n", argv[0]);
         return 2;
@@ -248,7 +257,17 @@ int main(int argc, char** argv) {
 
     AlignmentResult rgpu;
 
-    if (mode == 2) {
+    if (mode == 3) {
+        init_shared_graph(&ggpu, &cudaGraph, M);
+
+        switch (gpu_version) {
+            case 0: case 1: rgpu = gpu_align_no_copy_naive(ggpu, cudaGraph, seq); break;
+            case 2: case 3: case 4: case 5: rgpu = gpu_align_no_copy_level(ggpu, cudaGraph, seq); break;
+            case 6: rgpu = gpu_align_no_copy_shared_mem(ggpu, cudaGraph, seq); break;
+            default: fprintf(stderr, "unknown no-copy version %d\n", gpu_version); return 2;
+        }
+    }
+    else if (mode == 2) {
         switch (gpu_version) {
             case 0: init_hybrid_graph(&ggpu, &cudaGraph, M); break;
             case 1: init_unified_graph(&ggpu, &cudaGraph, M); break;

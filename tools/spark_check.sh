@@ -8,7 +8,9 @@
 #                                       per level overheads)
 #   2. bin/main <ds> 2 1|2|3          - the three hybrid memory variants, repeated, with
 #                                       HYBRID_STATS=1 so each run reports launch / wait / cpu
-#   3. bin/main <ds> 1 6 and 0 3      - the two versions that are already stable, as a reference
+#   3. bin/main <ds> 3 2|6            - the GPU only versions on the same shared graph, so the
+#                                       hybrid can be compared against a GPU that also pays no copies
+#   4. bin/main <ds> 1 6 and 0 3      - the two versions that are already stable, as a reference
 #
 #   tools/spark_check.sh                       # 150_10, 5 repeats
 #   tools/spark_check.sh -d 500_10 -n 10
@@ -48,7 +50,7 @@ echo "building..."
 make >/dev/null 2>&1 || { echo "make failed"; exit 2; }
 make -C tools spark_probe >/dev/null 2>&1 || { echo "probe build failed"; exit 2; }
 
-echo "1/3 machine probe"
+echo "1/4 machine probe"
 {
     echo
     echo "################ machine probe ################"
@@ -56,24 +58,30 @@ echo "1/3 machine probe"
 } >> "$LOG"
 
 run_version() {
-    local mode="$1" version="$2" label="$3"
+    local mode="$1" version="$2" label="$3" kind="${4:-}"
     echo "  $label"
     {
         echo
         echo "################ $label  (mode $mode version $version) ################"
         for i in $(seq 1 "$REPEATS"); do
-            HYBRID_STATS=1 ./bin/main "$DATASET" "$mode" "$version" 2>&1 \
-                | grep -E "^\[hybrid\]|^Iteration|^Arithmetic|Identity Score"
+            SHARED_MEM_KIND="${kind:-advised}" HYBRID_STATS=1 ./bin/main "$DATASET" "$mode" "$version" 2>&1 \
+                | grep -E "^\[hybrid\]|^\[no_copy\]|^Iteration|^Arithmetic|Identity Score|^Shared graph"
         done
     } >> "$LOG"
 }
 
-echo "2/3 hybrid memory variants"
+echo "2/4 hybrid memory variants"
 run_version 2 1 "hybrid_unified  (managed memory, one sync per CPU level)"
 run_version 2 2 "hybrid_pinned   (pinned host memory, pages never move)"
 run_version 2 3 "hybrid_advised  (managed + preferred location host, accessed by device)"
 
-echo "3/3 stable references"
+echo "3/4 GPU only without copies (mode 3)"
+run_version 3 2 "no_copy level      (one launch per level, pinned)"  pinned
+run_version 3 2 "no_copy level      (one launch per level, advised)" advised
+run_version 3 6 "no_copy shared_mem (shared memory kernel, pinned)"  pinned
+run_version 3 6 "no_copy shared_mem (shared memory kernel, advised)" advised
+
+echo "4/4 stable references"
 run_version 1 6 "gpu shared_mem  (explicit copies, was stable)"
 run_version 0 3 "cpu simd_parallel_node (no CUDA, was stable)"
 

@@ -15,7 +15,7 @@
 set -u
 
 DATASETS="5_15 20_10 30_5 150_10_small 500_10"
-VERSIONS="1:0 1:2 1:3 1:4 1:5 1:6 2:0 2:1 2:2 2:3"
+VERSIONS="1:0 1:2 1:3 1:4 1:5 1:6 2:0 2:1 2:2 2:3 3:0 3:2 3:6"
 BLOCKSIZES=""                       # empty -> whatever include/cuda_utils.cuh defines
 OUT="outputs/verify.csv"
 

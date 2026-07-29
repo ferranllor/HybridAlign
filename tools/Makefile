@@ -24,7 +24,7 @@ OBJ_DIR = obj
 BIN_DIR = bin
 
 CU_SRC  = cuda_naive cuda_parallel_node cuda_parallel_async cuda_async_monolithic \
-          cuda_async_batching cuda_shared_mem hybrid_base hybrid_unified hybrid_pinned
+          cuda_async_batching cuda_shared_mem hybrid_base hybrid_unified hybrid_pinned cuda_no_copy
 CU_OBJ  = $(patsubst %,$(OBJ_DIR)/%.o,$(CU_SRC))
 C_OBJ   = $(OBJ_DIR)/cpu_sequential.o $(OBJ_DIR)/cpu_simd_parallel_node.o
 

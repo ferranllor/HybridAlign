@@ -33,13 +33,13 @@ except ImportError:
 # fixed CPU / GPU / hybrid grouping, never by colour alone.
 THEME = {
     "light": dict(surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e", grid="#dedcd6",
-                  cpu="#eb6834", gpu="#2a78d6", hybrid="#1baf7a"),
+                  cpu="#eb6834", gpu="#2a78d6", hybrid="#1baf7a", nocopy="#eda100"),
     "dark":  dict(surface="#1a1a19", ink="#ffffff", ink2="#c3c2b7", grid="#3a3a37",
-                  cpu="#d95926", gpu="#3987e5", hybrid="#199e70"),
+                  cpu="#d95926", gpu="#3987e5", hybrid="#199e70", nocopy="#c98500"),
 }
 
-MODE_NAMES = {0: "CPU", 1: "GPU", 2: "HYB"}
-MODE_COLORS = {0: "cpu", 1: "gpu", 2: "hybrid"}
+MODE_NAMES = {0: "CPU", 1: "GPU", 2: "HYB", 3: "NCP"}
+MODE_COLORS = {0: "cpu", 1: "gpu", 2: "hybrid", 3: "nocopy"}
 
 
 def load(path):
