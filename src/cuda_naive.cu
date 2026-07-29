@@ -307,8 +307,6 @@ __global__ void compute_dp_gpu_naive(Node* node, Sequence sequence, Sequence seq
 
     __syncthreads();
 
-    // blockDim.x is not necessarily a power of two (BLOCKSIZE = 480), so the live range has to be
-    // halved rounding up: a plain >>= 1 silently drops the last element on every odd-sized step.
     for (unsigned int live = blockDim.x; live > 1; ) {
         unsigned int stride = (live + 1) / 2;
 
