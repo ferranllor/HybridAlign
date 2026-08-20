@@ -334,7 +334,7 @@ int main(int argc, char** argv) {
                 printf("  node %d (N=%d, M=%d, %s, bands=%d, num_in=%d): first mismatch at "
                        "node_j=%d query_i=%d (d=%d) cpu=%d gpu=%d\n",
                        n, N, M, (M >= N ? "M>=N" : "M<N"),
-                       ((M >= N ? N : M) + BLOCKSIZE - 1) / BLOCKSIZE, gcpu.nodes[n].num_in,
+                       ((M >= N ? N : M) + band_width_for_level(N, M) - 1) / band_width_for_level(N, M), gcpu.nodes[n].num_in,
                        first_i, first_j, first_i + first_j,
                        a[first_i * (M + 1) + first_j],
                        b[get_diagonal_index(first_j, first_i, M, N)]);

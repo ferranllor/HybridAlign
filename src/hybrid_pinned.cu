@@ -1,5 +1,6 @@
 #include "../include/hybrid_pinned.cuh"
 #include "../include/cuda_shared_mem.cuh"
+#include "../include/nvtx_ranges.cuh"
 
 #include "../include/definitions.h"
 extern "C" {
@@ -36,6 +37,8 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
     double t_launch = 0.0, t_sync = 0.0, t_cpu = 0.0, t_traceback = 0.0;
     double t_total = hybrid_now_ms();
     int gpu_levels = 0, cpu_levels = 0, syncs = 0;
+
+    NVTX_PUSH("setup", NVTX_COL_SETUP);
 
     Sequence sequence_rev;
     Sequence tmp;
@@ -76,17 +79,21 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
     int node_offset = 0;
     bool gpu_work_pending = false;
 
+    NVTX_POP(); // setup
+    NVTX_PUSH("align loop", NVTX_COL_SETUP);
+
     for (int d = 0; d < num_levels; d++)
     {
         if (nodes_per_level[d] >= HYBRID_MIN_NODES)
         {
+            NVTX_PUSHF(NVTX_COL_GPU, "gpu launch L%d (%d nodes)", d, nodes_per_level[d]);
+
             double t0 = hybrid_now_ms();
 
             dim3 gridDim(nodes_per_level[d]);
-            dim3 blockDim(BLOCKSIZE);
+            dim3 blockDim(band_width_for_level(max_node_size_per_level[d], sequence.size));
 
-            int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (max_node_size_per_level[d] + sequence.size + 2);
-            dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + max_node_size_per_level[d]);
+            int dynamic_shared_mem_bytes = shared_bytes_for_level(max_node_size_per_level[d], sequence.size, blockDim.x);
 
             compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
 
@@ -102,6 +109,8 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
             node_offset += nodes_per_level[d];
 
             t_launch += hybrid_now_ms() - t0;
+
+            NVTX_POP(); // gpu launch
         }
         else
         {
@@ -113,6 +122,8 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
             // that is still in flight has to be waited for.
             if (gpu_work_pending)
             {
+                NVTX_PUSH("wait for kernels", NVTX_COL_SYNC);
+
                 double t0 = hybrid_now_ms();
 
                 status = cudaStreamSynchronize(compute_stream);
@@ -123,7 +134,13 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
                 gpu_work_pending = false;
                 syncs++;
                 t_sync += hybrid_now_ms() - t0;
+
+                NVTX_POP(); // wait for kernels
             }
+
+            // One range for the whole run of CPU levels, which is also the granularity the OpenMP
+            // region is opened at: L%d-%d is the run, not a single level.
+            NVTX_PUSHF(NVTX_COL_CPU, "cpu levels L%d-%d", d, d_end - 1);
 
             double t0 = hybrid_now_ms();
 
@@ -146,6 +163,8 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
 
             t_cpu += hybrid_now_ms() - t0;
 
+            NVTX_POP(); // cpu levels
+
             for (int l = d; l < d_end; l++) {
                 act = &act[nodes_per_level[l]];
                 node_offset += nodes_per_level[l];
@@ -156,8 +175,12 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
         }
     }
 
+    NVTX_POP(); // align loop
+
     if (gpu_work_pending)
     {
+        NVTX_PUSH("final sync", NVTX_COL_SYNC);
+
         double t0 = hybrid_now_ms();
 
         status = cudaDeviceSynchronize();
@@ -167,7 +190,11 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
 
         syncs++;
         t_sync += hybrid_now_ms() - t0;
+
+        NVTX_POP(); // final sync
     }
+
+    NVTX_PUSH("merge scores", NVTX_COL_REDUCE);
 
     // Both sides wrote their scores into the same structs, so there is nothing to merge.
     graph.max_score = graph.nodes[0].max_score;
@@ -180,15 +207,23 @@ AlignmentResult gpu_align_hybrid_pinned(Graph graph, Graph cudaGraph, Sequence s
         }
     }
 
+    NVTX_POP(); // merge scores
+    NVTX_PUSH("teardown", NVTX_COL_SETUP);
+
     cudaStreamDestroy(compute_stream);
     free(nodes_per_level);
     free(max_node_size_per_level);
     cudaFree(sequence_rev.sequence);
     free(tmp.sequence);
 
+    NVTX_POP(); // teardown
+    NVTX_PUSH("traceback", NVTX_COL_TRACEBACK);
+
     double t0 = hybrid_now_ms();
     AlignmentResult res = compute_traceback_hybrid_pinned(graph, sequence);
     t_traceback = hybrid_now_ms() - t0;
+
+    NVTX_POP(); // traceback
 
     if (stats) {
         fprintf(stderr, "[hybrid] total %7.2f ms | launch %6.2f ms (%d levels) | wait %7.2f ms (%d syncs) "

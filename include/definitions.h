@@ -10,9 +10,28 @@
 #define DTYPEALPHABET char
 #define DTYPEMATRIX int
 
+// Highest valid version for each mode, used by main.c to validate the arguments and to print the
+// usage. Bump these when a new version is added to the switches in main.c.
+#define CPU_MAX_VERSION    3
+#define GPU_MAX_VERSION    7
+#define HYBRID_MAX_VERSION 3
+#define NOCOPY_MAX_VERSION 6
+
 #define WARMUP 1
 #define NITER 3
 #define CHUNKSIZE 32
+#define WORKPOOLSIZE 32
+#define NKERNELS 0
+
+// How many node ids the host tries to drop into a worker's ring per visit. One doorbell write and
+// one read of the worker's side of the ring then cover BATCHSIZE nodes instead of one, which is
+// what the wide levels care about. Capped by the ring at WORKPOOLSIZE - 1.
+#ifndef BATCHSIZE
+#define BATCHSIZE 8
+#endif
+#define CACHELINE 128    // doorbells are padded to this so two workers never share a line
+#define BACKOFF_NS 128   // how long a worker parks between two polls of its ring
+#define WATCHDOG_SPINS 2000000L // PK_DEBUG only: yields to wait on a level before crying deadlock
 
 // *************************************************************************************************
 //
@@ -45,12 +64,12 @@ typedef struct Node {
 } Node;
 
 typedef struct Communicator {
-    int id;
-    bool* job_ready, *job_done, *done;
-
-    int* nodeId;
+    bool *done;
+    int *work_top, *work_bottom;
+    int *workPool;
 
     // TODO: Add stuff to comunicate to GPU that some columns are already done on the CPU, mainly small diagonals, and maybe also tell to stop earlier
+    // Optimisation idea, if latency is a problem, maybe try to put everything in the same cache line, except for work pool if too big I guess.
 } Communicator;
 
 typedef struct Graph { 

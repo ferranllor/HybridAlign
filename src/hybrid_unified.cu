@@ -1,5 +1,6 @@
 #include "../include/hybrid_unified.cuh"
 #include "../include/cuda_shared_mem.cuh"
+#include "../include/nvtx_ranges.cuh"
 
 #include "../include/definitions.h"
 extern "C" {
@@ -8,6 +9,8 @@ extern "C" {
 
 AlignmentResult gpu_align_hybrid_unified(Graph graph, Graph cudaGraph, Sequence sequence)
 {
+    NVTX_PUSH("setup", NVTX_COL_SETUP);
+
     Sequence sequence_rev;
     Sequence tmp;
 
@@ -47,15 +50,19 @@ AlignmentResult gpu_align_hybrid_unified(Graph graph, Graph cudaGraph, Sequence 
     Node* act = graph.nodes; // host and device walk the very same array
     int node_offset = 0;
 
+    NVTX_POP(); // setup
+    NVTX_PUSH("align loop", NVTX_COL_SETUP);
+
     for (int d = 0; d < num_levels; d++)
     {
         if (nodes_per_level[d] >= HYBRID_MIN_NODES)
         {
-            dim3 gridDim(nodes_per_level[d]);
-            dim3 blockDim(BLOCKSIZE);
+            NVTX_PUSHF(NVTX_COL_GPU, "gpu launch L%d (%d nodes)", d, nodes_per_level[d]);
 
-            int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (max_node_size_per_level[d] + sequence.size + 2);
-            dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + max_node_size_per_level[d]);
+            dim3 gridDim(nodes_per_level[d]);
+            dim3 blockDim(band_width_for_level(max_node_size_per_level[d], sequence.size));
+
+            int dynamic_shared_mem_bytes = shared_bytes_for_level(max_node_size_per_level[d], sequence.size, blockDim.x);
 
             compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
 
@@ -63,15 +70,23 @@ AlignmentResult gpu_align_hybrid_unified(Graph graph, Graph cudaGraph, Sequence 
             if (launch_status != cudaSuccess) {
                 fprintf(stderr, "Kernel Launch Error: %s\n", cudaGetErrorString(launch_status));
             }
+
+            NVTX_POP(); // gpu launch
         }
         else
         {
             // Nothing to copy: the level reads the matrices the kernels just wrote, in place. Only
             // the ordering has to be enforced.
+            NVTX_PUSH("wait for kernels", NVTX_COL_SYNC);
+
             status = cudaStreamSynchronize(compute_stream);
             if (status != cudaSuccess) {
                 fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
             }
+
+            NVTX_POP(); // wait for kernels
+
+            NVTX_PUSHF(NVTX_COL_CPU, "cpu level L%d (%d nodes)", d, nodes_per_level[d]);
 
             if (nodes_per_level[d] > 1)
             {
@@ -85,16 +100,24 @@ AlignmentResult gpu_align_hybrid_unified(Graph graph, Graph cudaGraph, Sequence 
             {
                 compute_dp_cpu_simd_parallel_node(&graph.nodes[node_offset], sequence);
             }
+
+            NVTX_POP(); // cpu level
         }
 
         act = &act[nodes_per_level[d]];
         node_offset += nodes_per_level[d];
     }
 
+    NVTX_POP(); // align loop
+    NVTX_PUSH("final sync", NVTX_COL_SYNC);
+
     status = cudaDeviceSynchronize();
     if (status != cudaSuccess) {
         fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
     }
+
+    NVTX_POP(); // final sync
+    NVTX_PUSH("merge scores", NVTX_COL_REDUCE);
 
     // Both sides wrote their scores into the same structs, so there is nothing to merge either.
     graph.max_score = graph.nodes[0].max_score;
@@ -107,13 +130,23 @@ AlignmentResult gpu_align_hybrid_unified(Graph graph, Graph cudaGraph, Sequence 
         }
     }
 
+    NVTX_POP(); // merge scores
+    NVTX_PUSH("teardown", NVTX_COL_SETUP);
+
     cudaStreamDestroy(compute_stream);
     free(nodes_per_level);
     free(max_node_size_per_level);
     cudaFree(sequence_rev.sequence);
     free(tmp.sequence);
 
-    return compute_traceback_hybrid_unified(graph, sequence);
+    NVTX_POP(); // teardown
+    NVTX_PUSH("traceback", NVTX_COL_TRACEBACK);
+
+    AlignmentResult res = compute_traceback_hybrid_unified(graph, sequence);
+
+    NVTX_POP(); // traceback
+
+    return res;
 }
 
 AlignmentResult compute_traceback_hybrid_unified(Graph graph, Sequence sequence) {

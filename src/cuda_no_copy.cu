@@ -180,15 +180,14 @@ AlignmentResult gpu_align_no_copy_shared_mem(Graph graph, Graph cudaGraph, Seque
 
     double t0 = no_copy_now_ms();
 
-    dim3 blockDim(BLOCKSIZE);
     Node* act = cudaGraph.nodes;
 
     for (int d = 0; d < num_levels; d++)
     {
         dim3 gridDim(nodes_per_level[d]);
+        dim3 blockDim(band_width_for_level(max_node_size_per_level[d], sequence.size));
 
-        int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (max_node_size_per_level[d] + sequence.size + 2);
-        dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + max_node_size_per_level[d]);
+        int dynamic_shared_mem_bytes = shared_bytes_for_level(max_node_size_per_level[d], sequence.size, blockDim.x);
 
         compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
 

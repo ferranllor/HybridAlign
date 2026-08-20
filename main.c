@@ -20,6 +20,7 @@
 #include "include/cuda_async_monolithic.cuh"
 #include "include/cuda_async_batching.cuh"
 #include "include/cuda_shared_mem.cuh"
+#include "include/cuda_persistent_kernels.cuh"
 
 #include "include/hybrid_base.cuh"
 #include "include/hybrid_unified.cuh"
@@ -365,6 +366,60 @@ void verify_alignment(const char* align_graph, const char* align_query, Sequence
 
 // *************************************************************************************************
 //
+//                                             Usage
+//
+// *************************************************************************************************
+
+static void print_usage(const char* program)
+{
+    fprintf(stderr, "Format is %s <dataset> <mode> <version>\n", program);
+    fprintf(stderr, "Example: %s 150_10 1 7\n", program);
+
+    fprintf(stderr, "\n --- First argument: dataset --- \n");
+    fprintf(stderr, "String: name of the file pair in datasets/old to be used for input/sequence (Ex. 150_10)\n");
+
+    fprintf(stderr, "\n --- Second argument: mode --- \n");
+    fprintf(stderr, "0 = CPU-only\n");
+    fprintf(stderr, "1 = GPU-only\n");
+    fprintf(stderr, "2 = CPU-GPU exec (hybrid)\n");
+    fprintf(stderr, "3 = GPU-only on a shared graph, no copies (SHARED_MEM_KIND=advised|pinned|managed)\n");
+
+    fprintf(stderr, "\n --- Third argument: version --- \n");
+
+    fprintf(stderr, " Mode 0 (CPU-only), 0-%d:\n", CPU_MAX_VERSION);
+    fprintf(stderr, "   0 = sequential\n");
+    fprintf(stderr, "   1 = simd\n");
+    fprintf(stderr, "   2 = simd, parallel over the dp matrix\n");
+    fprintf(stderr, "   3 = simd, parallel over the nodes\n");
+
+    fprintf(stderr, " Mode 1 (GPU-only), 0-%d:\n", GPU_MAX_VERSION);
+    fprintf(stderr, "   0 = naive (pageable host graph)\n");
+    fprintf(stderr, "   1 = naive (pinned host graph)\n");
+    fprintf(stderr, "   2 = parallel node\n");
+    fprintf(stderr, "   3 = parallel async\n");
+    fprintf(stderr, "   4 = async monolithic\n");
+    fprintf(stderr, "   5 = async batching\n");
+    fprintf(stderr, "   6 = shared mem\n");
+    fprintf(stderr, "   7 = persistent kernels\n");
+
+    fprintf(stderr, " Mode 2 (hybrid CPU-GPU), 0-%d:\n", HYBRID_MAX_VERSION);
+    fprintf(stderr, "   0 = base (explicit copies)\n");
+    fprintf(stderr, "   1 = unified (managed memory)\n");
+    fprintf(stderr, "   2 = pinned\n");
+    fprintf(stderr, "   3 = advised (managed memory, migration hints)\n");
+
+    fprintf(stderr, " Mode 3 (no-copy, for DGX), 0-%d:\n", NOCOPY_MAX_VERSION);
+    fprintf(stderr, "   0 = naive\n");
+    fprintf(stderr, "   1 = naive\n");
+    fprintf(stderr, "   2 = level\n");
+    fprintf(stderr, "   3 = level\n");
+    fprintf(stderr, "   4 = level\n");
+    fprintf(stderr, "   5 = level\n");
+    fprintf(stderr, "   6 = shared mem\n");
+}
+
+// *************************************************************************************************
+//
 //                                             Main
 //
 // *************************************************************************************************
@@ -375,20 +430,36 @@ int main(int argc, char *argv[]) {
 
     if (argc < 4)
     {
-        fprintf(stderr, "Too few number of arguments! Format is %s [0-2] [0-n]\n", (char*)argv[0]);
-        fprintf(stderr, " --- First argument: --- \n");
-        fprintf(stderr, "String: name of the file pair in datasets/old to be used for input/sequence (Ex. 150_10)\n");
-        fprintf(stderr, " --- Second argument: --- \n");
-        fprintf(stderr, "0 = CPU-only\n"); 
-        fprintf(stderr, "1 = GPU-only\n"); 
-        fprintf(stderr, "2 = CPU-GPU exec (hybrid)\n"); 
-    fprintf(stderr, "3 = GPU-only on a shared graph, no copies (SHARED_MEM_KIND=advised|pinned|managed)\n"); 
-        fprintf(stderr, " --- Third argument: --- \n"); 
-        fprintf(stderr, "0: 0-3 For CPU-only\n"); 
-        fprintf(stderr, "1: 0-5 For GPU-only\n"); 
-        fprintf(stderr, "2: 0-3 For hybrid CPU-GPU\n"); 
-    fprintf(stderr, "3: 0-6 Same versions as GPU-only, without the copies\n"); 
-        return -1; 
+        fprintf(stderr, "Too few number of arguments!\n");
+        print_usage((char*)argv[0]);
+        return -1;
+    }
+
+    int mode = atoi(argv[2]);
+    int version = atoi(argv[3]);
+
+    bool CPU = (mode == 0);
+    bool GPU = (mode == 1);
+    bool Hybrid = (mode == 2);
+    bool NoCopy = (mode == 3);
+
+    if (!CPU && !GPU && !Hybrid && !NoCopy)
+    {
+        fprintf(stderr, "Invalid mode %d!\n", mode);
+        print_usage((char*)argv[0]);
+        return -1;
+    }
+
+    bool valid = version >= 0 && ((CPU    && version <= CPU_MAX_VERSION)
+                               || (GPU    && version <= GPU_MAX_VERSION)
+                               || (Hybrid && version <= HYBRID_MAX_VERSION)
+                               || (NoCopy && version <= NOCOPY_MAX_VERSION));
+
+    if (!valid)
+    {
+        fprintf(stderr, "Invalid version %d for mode %d!\n", version, mode);
+        print_usage((char*)argv[0]);
+        return -1;
     }
 
     /*
@@ -422,14 +493,6 @@ int main(int argc, char *argv[]) {
 
     printf("Successfully loaded input, proceeding with verification run.\n");
 
-    int mode = atoi(argv[2]);
-    int version = atoi(argv[3]);
-
-    bool CPU = (mode == 0);
-    bool GPU = (mode == 1);
-    bool Hybrid = (mode == 2);
-    bool NoCopy = (mode == 3);
-
     if (CPU) {
         init_cpu_graph(&graph, sequence.size);
     }
@@ -442,6 +505,7 @@ int main(int argc, char *argv[]) {
             case 4: init_cpu_graph_pinned(&graph, sequence.size); break;
             case 5: init_cpu_graph_pinned(&graph, sequence.size); break;
             case 6: init_cpu_graph_pinned(&graph, sequence.size); break;
+            case 7: init_cpu_graph_pinned(&graph, sequence.size); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
         
@@ -489,6 +553,7 @@ int main(int argc, char *argv[]) {
             case 4: res = gpu_align_async_monolithic(graph, cudaGraph, sequence); break;
             case 5: res = gpu_align_async_batching(graph, cudaGraph, sequence); break;
             case 6: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
+            case 7: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
     }
@@ -550,6 +615,7 @@ int main(int argc, char *argv[]) {
                 case 4: res = gpu_align_async_monolithic(graph, cudaGraph, sequence); break;
                 case 5: res = gpu_align_async_batching(graph, cudaGraph, sequence); break;
                 case 6: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
+                case 7: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }
@@ -604,6 +670,7 @@ int main(int argc, char *argv[]) {
             case 4: free_cpu_graph_pinned(&graph); break;
             case 5: free_cpu_graph_pinned(&graph); break;
             case 6: free_cpu_graph_pinned(&graph); break;
+            case 7: free_cpu_graph_pinned(&graph); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
         

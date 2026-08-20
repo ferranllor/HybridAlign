@@ -1,5 +1,6 @@
 #include "../include/hybrid_base.cuh"
 #include "../include/cuda_shared_mem.cuh"
+#include "../include/nvtx_ranges.cuh"
 
 #include "../include/definitions.h"
 extern "C" {
@@ -8,6 +9,8 @@ extern "C" {
 
 AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence sequence)
 {
+    NVTX_PUSH("setup", NVTX_COL_SETUP);
+
     Sequence sequence_rev;
     Sequence tmp;
 
@@ -56,21 +59,25 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
     Node* batch_start_act  = act;   // device pointer at start of current batch
     size_t batch_bytes = 0;         // matrices already queued in this batch
 
+    NVTX_POP(); // setup
+    NVTX_PUSH("align loop", NVTX_COL_SETUP);
+
     for (int d = 0; d < num_levels; d++)
     {
         bool level_on_gpu = (nodes_per_level[d] >= HYBRID_MIN_NODES);
 
         if (level_on_gpu)
         {
-            dim3 gridDim(nodes_per_level[d]);
-            dim3 blockDim(BLOCKSIZE);
+            NVTX_PUSHF(NVTX_COL_GPU, "gpu launch L%d (%d nodes)", d, nodes_per_level[d]);
 
             int max_node_size = 0;
             for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++)
                 if (graph.nodes[n].sequence.size > max_node_size) max_node_size = graph.nodes[n].sequence.size;
 
-            int dynamic_shared_mem_bytes = sizeof(DTYPEMATRIX) * (max_node_size + sequence.size + 2);
-            dynamic_shared_mem_bytes += sizeof(DTYPEALPHABET) * (sequence.size + max_node_size);
+            dim3 gridDim(nodes_per_level[d]);
+            dim3 blockDim(band_width_for_level(max_node_size, sequence.size));
+
+            int dynamic_shared_mem_bytes = shared_bytes_for_level(max_node_size, sequence.size, blockDim.x);
 
             compute_dp_gpu_shared_mem<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(act, sequence, sequence_rev);
 
@@ -84,6 +91,8 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
 
             act = &act[nodes_per_level[d]];
             node_offset += nodes_per_level[d];
+
+            NVTX_POP(); // gpu launch
         }
 
         // The batch has to be on the host before the next CPU level reads it, and the levels are
@@ -93,6 +102,8 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
 
         if (batch_bytes > 0 && (batch_bytes >= BATCH_BYTES || next_level_on_cpu || last_level))
         {
+            NVTX_PUSHF(NVTX_COL_COPY, "queue D2H batch (%zu KB)", batch_bytes / 1024);
+
             // one sync point for the whole batch, not one per level
             cudaEventRecord(compute_done, compute_stream);
             cudaStreamWaitEvent(copy_stream, compute_done, 0);
@@ -116,16 +127,24 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
             batch_start_offset = node_offset;
             batch_start_act = act;
             batch_bytes = 0;
+
+            NVTX_POP(); // queue D2H batch
         }
 
         if (!level_on_gpu)
         {
             // Everything this level reads (the last column of each predecessor) has to have landed
             // on the host already.
+            NVTX_PUSH("wait for D2H", NVTX_COL_SYNC);
+
             status = cudaStreamSynchronize(copy_stream);
             if (status != cudaSuccess) {
                 fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
             }
+
+            NVTX_POP(); // wait for D2H
+
+            NVTX_PUSHF(NVTX_COL_CPU, "cpu level L%d (%d nodes)", d, nodes_per_level[d]);
 
             // Half of these levels hold a single node, and opening a parallel region for one node
             // costs more than the node does.
@@ -142,9 +161,13 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
                 compute_dp_cpu_simd_parallel_node(&graph.nodes[node_offset], sequence);
             }
 
+            NVTX_POP(); // cpu level
+
             // Only worth uploading if some later level still runs on the device.
             if (d < last_gpu_level)
             {
+                NVTX_PUSHF(NVTX_COL_COPY, "H2D level L%d", d);
+
                 size_t level_bytes = 0;
                 for (int n = node_offset; n < node_offset + nodes_per_level[d]; n++)
                     level_bytes += (size_t)(sequence.size + 2) * (graph.nodes[n].sequence.size + 2) * sizeof(DTYPEMATRIX);
@@ -153,6 +176,8 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
                            graph.nodes[node_offset].dp_matrix,
                            level_bytes,
                            cudaMemcpyHostToDevice);
+
+                NVTX_POP(); // H2D level
             }
 
             act = &act[nodes_per_level[d]];
@@ -164,10 +189,16 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
         }
     }
 
+    NVTX_POP(); // align loop
+    NVTX_PUSH("final sync", NVTX_COL_SYNC);
+
     status = cudaDeviceSynchronize();
     if (status != cudaSuccess) {
         fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(status));
     }
+
+    NVTX_POP(); // final sync
+    NVTX_PUSH("merge scores", NVTX_COL_REDUCE);
 
     // The GPU levels wrote their scores into the device node structs, the CPU levels wrote theirs
     // straight into the host ones, so only the former have to be taken over.
@@ -194,6 +225,9 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
         }
     }
 
+    NVTX_POP(); // merge scores
+    NVTX_PUSH("teardown", NVTX_COL_SETUP);
+
     cudaEventDestroy(compute_done);
     cudaStreamDestroy(compute_stream);
     cudaStreamDestroy(copy_stream);
@@ -203,7 +237,14 @@ AlignmentResult gpu_align_hybrid_base(Graph graph, Graph cudaGraph, Sequence seq
     cudaFreeHost(device_nodes_tmp);
     free(device_nodes_pointers);
 
-    return compute_traceback_hybrid_base(graph, sequence);
+    NVTX_POP(); // teardown
+    NVTX_PUSH("traceback", NVTX_COL_TRACEBACK);
+
+    AlignmentResult res = compute_traceback_hybrid_base(graph, sequence);
+
+    NVTX_POP(); // traceback
+
+    return res;
 }
 
 AlignmentResult compute_traceback_hybrid_base(Graph graph, Sequence sequence) {
