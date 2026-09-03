@@ -1,27 +1,45 @@
-#include "../include/cuda_shared_mem.cuh"
 #include "../include/cuda_persistent_kernels.cuh"
-#include "../include/cuda_dp_shared_mem.cuh"
+#include "../include/cuda_registers.cuh"
+#include "../include/cuda_dp_registers.cuh"
+
+#include "../include/hybrid_utils.cuh"
 
 #include <sched.h>
 
+// The persistent workers on the registers core. A worker used to be a thread block of band_width
+// threads filling a whole dp matrix; it is a warp now, doing one node with the three diagonals in
+// registers and leaving only its last column behind. So a block of WARPS_PER_BLOCK warps is
+// WARPS_PER_BLOCK independent workers, each with its own ring, and the block barriers the old
+// worker needed are gone with them: lane 0 polls the ring and the shuffles are the rest of the
+// synchronisation.
 
-__global__ void worker(Communicator** communicators, Node* nodes, Sequence sequence, Sequence sequence_rev)
+__global__ void worker(Communicator** communicators, Node* nodes, Sequence sequence,
+                       Sequence sequence_rev, int elems_per_warp, int toprow_slots)
 {
-    Communicator* comm = communicators[blockIdx.x]; // Worker id, each thread block gets one, so we use the blockId
+    const unsigned int mask = 0xffffffffu;
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp_in_block = threadIdx.x / WARP_SIZE;
+
+    int worker_id = blockIdx.x * (blockDim.x / WARP_SIZE) + warp_in_block; // Worker id, each warp gets one
+
+    Communicator* comm = communicators[worker_id];
 
     volatile int*  work_top    = comm->work_top;
     volatile int*  work_bottom = comm->work_bottom;
     volatile int*  workPool    = comm->workPool;
     volatile bool* done        = comm->done;
 
-    __shared__ int s_node_id; // only thread 0 polls, the rest of the block reads its verdict here
+    extern __shared__ DTYPEMATRIX shared[];
+
+    DTYPEMATRIX* mine = &shared[warp_in_block * elems_per_warp];
 
     while (true)
     {
-        if (threadIdx.x == 0)
+        int node_id = -1;
+
+        if (lane == 0)
         {
             int bottom = work_bottom[0];
-            int node_id = -1;
 
             while (true)
             {
@@ -30,27 +48,34 @@ __global__ void worker(Communicator** communicators, Node* nodes, Sequence seque
 
                 __nanosleep(BACKOFF_NS); // wait for a bit, no need to saturate the controller with high-latency requests
             }
-
-            s_node_id = node_id;
         }
 
-        __syncthreads();
+        node_id = __shfl_sync(mask, node_id, 0); // only lane 0 polls, the rest of the warp reads its verdict here
 
-        int node_id = s_node_id;
         if (node_id < 0) break;
 
-        compute_dp_node_shared_mem(&nodes[node_id], sequence, sequence_rev);
+        int local_max, local_max_d, local_max_j;
 
-        __syncthreads();
+        compute_dp_node_registers(&nodes[node_id], sequence.size, sequence_rev.sequence, 0,
+                                  mine, toprow_slots, local_max, local_max_d, local_max_j);
+
+        __syncwarp(mask);
 
         // Publish the node before publishing the fact that it is finished.
-        
-        if (threadIdx.x == 0) {
+
+        if (lane == 0) {
+            Node* node = &nodes[node_id];
+
+            node->max_score = local_max;
+            node->max_score_d = local_max_d;
+            node->max_score_i = (local_max_d != -1) ? (local_max_d - local_max_j) : -1;
+            node->max_score_j = (local_max_d != -1) ? local_max_j : -1;
+
             __threadfence_system();
             work_bottom[0] = (work_bottom[0] + 1) % WORKPOOLSIZE;
         }
 
-        __syncthreads();
+        __syncwarp(mask);
     }
 
     return;
@@ -109,8 +134,11 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
     for (int n = 0; n < graph.num_nodes; n++)
         if (graph.nodes[n].sequence.size > max_node_size) max_node_size = graph.nodes[n].sequence.size;
 
-    int band = band_width_for_level(max_node_size, sequence.size);
-    int dynamic_shared_mem_bytes = shared_bytes_for_level(max_node_size, sequence.size, band);
+    int toprow_slots = registers_dp_toprow_slots(max_node_size, sequence.size);
+    int elems_per_warp = registers_dp_elems_per_warp(max_node_size, sequence.size);
+
+    int block_threads = WARPS_PER_BLOCK * WARP_SIZE;
+    int dynamic_shared_mem_bytes = WARPS_PER_BLOCK * elems_per_warp * sizeof(DTYPEMATRIX);
 
     if (dynamic_shared_mem_bytes > 48 * 1024) {
         cudaError_t attr_status = cudaFuncSetAttribute(worker, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_shared_mem_bytes);
@@ -121,20 +149,26 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
     }
 
     // NKERNELS 0 means "fill the device". We will launch as many blocks as can reside on the GPU
-    int num_kernels = NKERNELS;
-    if (num_kernels <= 0) {
+    int num_blocks = NKERNELS;
+    if (num_blocks <= 0) {
         int blocks_per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, worker, band, dynamic_shared_mem_bytes);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, worker, block_threads, dynamic_shared_mem_bytes);
 
         if (blocks_per_sm < 1) blocks_per_sm = 1; // the query says the kernel does not fit; one block is still resident
-        num_kernels = prop.multiProcessorCount * blocks_per_sm;
+        num_blocks = prop.multiProcessorCount * blocks_per_sm;
     }
 
-    if (num_kernels > graph.num_nodes) num_kernels = graph.num_nodes; // no point in more workers than nodes
+    // no point in more workers than nodes, but a block is WARPS_PER_BLOCK of them and cannot be split
+    if (num_blocks * WARPS_PER_BLOCK > graph.num_nodes)
+        num_blocks = (graph.num_nodes + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-    Communicator** communicators = (Communicator**)alloc_shared_flags(num_kernels * sizeof(Communicator*));
+    if (num_blocks < 1) num_blocks = 1;
 
-    for (int k = 0; k < num_kernels; k++) {
+    int num_workers = num_blocks * WARPS_PER_BLOCK;
+
+    Communicator** communicators = (Communicator**)alloc_shared_flags(num_workers * sizeof(Communicator*));
+
+    for (int k = 0; k < num_workers; k++) {
         communicators[k] = (Communicator*)alloc_shared_flags(sizeof(Communicator));
 
         Communicator* comm = communicators[k];
@@ -161,10 +195,11 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
 
     // STEP 1: Launch kernels
 
-    dim3 gridDim(num_kernels);
-    dim3 blockDim(band);
+    dim3 gridDim(num_blocks);
+    dim3 blockDim(block_threads);
 
-    worker<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(communicators, cudaGraph.nodes, sequence, sequence_rev);
+    worker<<<gridDim, blockDim, dynamic_shared_mem_bytes, compute_stream>>>(
+        communicators, cudaGraph.nodes, sequence, sequence_rev, elems_per_warp, toprow_slots);
 
     cudaError_t launch_status = cudaGetLastError();
     if (launch_status != cudaSuccess) {
@@ -205,11 +240,11 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
                 ++n;
             }
 
-            k = (k + 1) % num_kernels;
+            k = (k + 1) % num_workers;
         }
 
         // Wait for all workers to finish working on the level
-        for (int w = 0; w < num_kernels; w++) {
+        for (int w = 0; w < num_workers; w++) {
             volatile int* work_top    = communicators[w]->work_top;
             volatile int* work_bottom = communicators[w]->work_bottom;
 
@@ -218,7 +253,7 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
             }
         }
 
-        // STEP 3: Copy the dp matrices back to main mem
+        // STEP 3: Copy the last columns back to main mem
 
         node_offset += nodes_per_level[l];
         levels_in_batch++;
@@ -235,17 +270,11 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
                             cudaMemcpyDeviceToHost,
                             copy_stream);
 
-            size_t batch_matrix_elements = 0;
-            for (int n = batch_start_offset; n < node_offset; n++)
-                batch_matrix_elements += (size_t)(sequence.size + 2) * (graph.nodes[n].sequence.size + 2);
-
-            if (batch_matrix_elements > 0) {
-                cudaMemcpyAsync(graph.nodes[batch_start_offset].dp_matrix,
-                                device_nodes_pointers[batch_start_offset].dp_matrix,
-                                batch_matrix_elements * sizeof(DTYPEMATRIX),
-                                cudaMemcpyDeviceToHost,
-                                copy_stream);
-            }
+            cudaMemcpyAsync(graph.nodes[batch_start_offset].last_col,
+                            device_nodes_pointers[batch_start_offset].last_col,
+                            (size_t)batch_num_nodes * (sequence.size + 1) * sizeof(DTYPEMATRIX),
+                            cudaMemcpyDeviceToHost,
+                            copy_stream);
 
             batch_start_offset = node_offset;
             levels_in_batch = 0;
@@ -254,7 +283,7 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
 
     // Every ring is drained at this point, so the workers are all parked in their spin loop and the
     // flag is the only thing they are still waiting for.
-    for (int k = 0; k < num_kernels; k++) {
+    for (int k = 0; k < num_workers; k++) {
         volatile bool* done = communicators[k]->done;
         __sync_synchronize(); // Claude did this. Honestly, I don't get it, but it works so that's ok i guess
         done[0] = true;
@@ -282,7 +311,7 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
         }
     }
 
-    for (int k = 0; k < num_kernels; k++) {
+    for (int k = 0; k < num_workers; k++) {
         cudaFreeHost(communicators[k]->done);
         cudaFreeHost(communicators[k]->work_top);
         cudaFreeHost(communicators[k]->work_bottom);
@@ -300,5 +329,5 @@ AlignmentResult gpu_align_persistent_kernels(Graph graph, Graph cudaGraph, Seque
     cudaFreeHost(device_nodes_tmp);
     free(device_nodes_pointers);
 
-    return compute_traceback_gpu_shared_mem(graph, sequence);
+    return compute_traceback_gpu_registers(graph, sequence);
 }

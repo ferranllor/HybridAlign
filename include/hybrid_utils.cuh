@@ -2,6 +2,12 @@
 #include "device_launch_parameters.h"
 #pragma once
 
+// How many warps will be in a block, each warp will then be given a node. Try to do a multiple of 4,
+// any less should be underutilising hardware
+#ifndef WARPS_PER_BLOCK
+#define WARPS_PER_BLOCK 4
+#endif
+
 // Levels holding fewer nodes than this are computed on the CPU instead of the GPU: one block per
 // node means a small level leaves the GPU almost empty, and the launch plus the level sync cost
 // more than the whole level does on 2 CPU threads.

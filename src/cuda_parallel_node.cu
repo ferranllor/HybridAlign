@@ -26,7 +26,6 @@ AlignmentResult gpu_align_parallel_node(Graph graph, Graph cudaGraph, Sequence s
 
     cudaError_t status;
     Node* act = cudaGraph.nodes;
-    int node_offset = 0;
 
     for (int d = 0; d < num_levels; d++)
     {
@@ -198,7 +197,7 @@ __global__ void compute_dp_gpu_parallel_node(Node* node, Sequence sequence, Sequ
     int offset_row1 = (l_min == M); // Same thing, but with the first row, so we ignore the last element on the diagonal
 
     if (N >= M) {
-        // Whiever is reading this, ignore this block, its just a matter of transitioning to a different way of indexing, because stuff is 
+        // Whoever is reading this, ignore this block, its just a matter of transitioning to a different way of indexing, because stuff is 
         // not in memory as it should be for the math to be pretty. This still counts as stable phase for all intents and purposes.
         // you will see that when the max is M this phase starts later. This happens because this shift is linked to when the first 
         // column stops being there. Maybe you should look for a different way that is more "consistent"? Idk, things like this (chapuzas) make me think

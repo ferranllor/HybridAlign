@@ -1,6 +1,12 @@
 #include "../include/cuda_async_batching.cuh"
 #include "../include/hybrid_utils.cuh" // BATCH_BYTES
 
+// *************************************************************************************************
+//
+//                                           Scheduler
+//
+// *************************************************************************************************
+
 AlignmentResult gpu_align_async_batching(Graph graph, Graph cudaGraph, Sequence sequence)
 {
     Sequence sequence_rev;
@@ -46,6 +52,7 @@ AlignmentResult gpu_align_async_batching(Graph graph, Graph cudaGraph, Sequence 
     // first copy command and nothing can be read back until all of it has landed. Bounding the
     // batch by size keeps the command count low on the long tail of tiny levels while still letting
     // the big ones leave one at a time.
+    
     int batch_start_offset = 0;   // node_offset at start of current batch
     Node* batch_start_act  = act; // device pointer at start of current batch
     size_t batch_bytes = 0;       // matrices already queued in this batch
@@ -128,6 +135,12 @@ AlignmentResult gpu_align_async_batching(Graph graph, Graph cudaGraph, Sequence 
 
     return compute_traceback_gpu_async_batching(graph, sequence);
 }
+
+// *************************************************************************************************
+//
+//                                            Kernel
+//
+// *************************************************************************************************
 
 __global__ void compute_dp_gpu_async_batching(Node* node, Sequence sequence, Sequence sequence_rev)
 {
@@ -515,6 +528,12 @@ __global__ void compute_dp_gpu_async_batching(Node* node, Sequence sequence, Seq
         node->max_score_j = local_max_j;
     }
 }
+
+// *************************************************************************************************
+//
+//                                            Traceback
+//
+// *************************************************************************************************
 
 AlignmentResult compute_traceback_gpu_async_batching(Graph graph, Sequence sequence) {
     Node* curr_node = &graph.nodes[graph.max_score_node_id];

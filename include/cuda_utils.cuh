@@ -5,7 +5,7 @@
 
 // Overridable from the command line (-DBLOCKSIZE=...) so tools/verify.sh can sweep them
 #ifndef BLOCKSIZE
-#define BLOCKSIZE 480
+#define BLOCKSIZE 160
 #endif
 
 // Three rotating diagonals (d, d - 1, d - 2) is all the recurrence needs; the extra buffers only
@@ -26,6 +26,13 @@ static inline int band_width_for_level(int max_node_size, int M) {
     return (w < BLOCKSIZE) ? w : BLOCKSIZE;
 }
 
+// The two sequences sit in the tail of a warp's shared memory as bytes, so how many DTYPEMATRIX
+// slots they take depends on the type: rounding up to whole slots instead of assuming four bytes.
+static inline int seq_slots_for_level(int max_node_size, int M) {
+    return (int)(((size_t)(max_node_size + M) * sizeof(DTYPEALPHABET) + sizeof(DTYPEMATRIX) - 1)
+                 / sizeof(DTYPEMATRIX));
+}
+
 // Dynamic shared memory of one block of such a level: topRow (only needed when the band runs along
 // the rows, i.e. M < N), prevCol, the N_BUFFERS rotating diagonals, then the two sequences.
 static inline int shared_bytes_for_level(int max_node_size, int M, int band_width) {
@@ -33,6 +40,26 @@ static inline int shared_bytes_for_level(int max_node_size, int M, int band_widt
     if (max_node_size > M) matrix_slots += max_node_size + 1;
 
     return (int)(matrix_slots * sizeof(DTYPEMATRIX) + (M + max_node_size) * sizeof(DTYPEALPHABET));
+}
+
+// Nice addition by claude, useful for bigger datasets.
+
+// A block can ask for at most this much dynamic shared memory without opting in to the larger per
+// SM carve out. The warp versions size their shared memory per warp rather than per block, so a
+// long enough query pushes a block over it: 2000_10 wants 65 KB for four warps. A launch that asks
+// for more does not fail loudly, it just does not run, and the alignment comes out quietly wrong,
+// so the schedulers check first and stop instead.
+#ifndef MAX_DYNAMIC_SHARED
+#define MAX_DYNAMIC_SHARED 49152
+#endif
+
+static inline void check_shared_fits(const char* who, int level, int bytes) {
+    if (bytes > MAX_DYNAMIC_SHARED) {
+        fprintf(stderr, "%s: level %d needs %d B of dynamic shared memory per block, over the %d B a "
+                        "block can take. Lower WARPS_PER_BLOCK, or this dataset's query is too long "
+                        "for the warp versions.\n", who, level, bytes, MAX_DYNAMIC_SHARED);
+        exit(1);
+    }
 }
 
 __device__ static inline int get_diag_start_device(int d, int M, int N) {

@@ -201,7 +201,7 @@ static const char* version_name(int mode, int v) {
         case 3: return "parallel_async";
         case 4: return "async_monolithic";
         case 5: return "async_batching";
-        case 6: return "shared_mem";
+        case 7: return "shared_mem";
         default: return "unknown";
     }
 }
@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
             case 3: rgpu = gpu_align_parallel_async(ggpu, cudaGraph, seq); break;
             case 4: rgpu = gpu_align_async_monolithic(ggpu, cudaGraph, seq); break;
             case 5: rgpu = gpu_align_async_batching(ggpu, cudaGraph, seq); break;
-            case 6: rgpu = gpu_align_shared_mem(ggpu, cudaGraph, seq); break;
+            case 7: rgpu = gpu_align_shared_mem(ggpu, cudaGraph, seq); break;
             default: fprintf(stderr, "unknown GPU version %d\n", gpu_version); return 2;
         }
     }

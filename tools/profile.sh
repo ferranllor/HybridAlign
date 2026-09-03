@@ -5,7 +5,7 @@
 # time is neither (launch gaps, syncs, CPU work).
 #
 #   tools/profile.sh                                  # default datasets/versions
-#   tools/profile.sh -d 150_10 -v "1:6 2:0 2:1"       # versions are mode:version, like verify.sh
+#   tools/profile.sh -d 150_10 -v "1:8 2:0 2:1"       # versions are mode:version, like verify.sh
 #   tools/profile.sh -o outputs/profile               # where reports and CSVs go
 #
 # Writes, per run:  <out>/<dataset>_<mode>.<version>.nsys-rep   (open in the Nsight Systems GUI)
@@ -25,7 +25,7 @@ set -u
 export LC_ALL=C
 
 DATASETS="150_10_small 150_10"
-VERSIONS="1:0 1:5 1:6 2:0 2:1"
+VERSIONS="1:0 1:5 1:7 1:8 1:9 1:10 2:0 2:1"
 OUT="outputs/profile"
 
 while getopts "d:v:o:h" opt; do

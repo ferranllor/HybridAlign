@@ -13,18 +13,26 @@
 #include "include/cpu_simd.h"
 #include "include/cpu_simd_parallel_dp.h"
 #include "include/cpu_simd_parallel_node.h"
+#include "include/cpu_last_col.h"
+#include "include/cpu_multi.h"
 
 #include "include/cuda_naive.cuh"
 #include "include/cuda_parallel_node.cuh"
 #include "include/cuda_parallel_async.cuh"
 #include "include/cuda_async_monolithic.cuh"
 #include "include/cuda_async_batching.cuh"
+#include "include/cuda_last_col.cuh"
+#include "include/cuda_warps.cuh"
+#include "include/cuda_registers.cuh"
+#include "include/cuda_multi.cuh"
+#include "include/cuda_multi_registers.cuh"
 #include "include/cuda_shared_mem.cuh"
 #include "include/cuda_persistent_kernels.cuh"
 
 #include "include/hybrid_base.cuh"
 #include "include/hybrid_unified.cuh"
 #include "include/hybrid_pinned.cuh"
+#include "include/hybrid_last_col.cuh"
 
 #include "include/cuda_no_copy.cuh"
 
@@ -40,6 +48,53 @@ int get_node_index(IDMap* map, int map_size, const char* name) {
     }
     return -1; // Not found
 }
+
+// Open addressed hash over the segment names, used by pass 3 to resolve the two endpoints of a
+// link. The linear scan above walked every segment name once per endpoint: on 150_10 that is
+// 50000 names x 2 x 80943 links, around two billion strcmp calls, and it was five of the six
+// seconds the loader spent before the first alignment even started.
+typedef struct {
+    int cap;        // power of two, so the wrap is a mask
+    int* slot;      // slot[h] = index into map, or -1
+    IDMap* map;
+} IDHash;
+
+static unsigned int id_hash_of(const char* s) {
+    unsigned int h = 2166136261u;   // FNV-1a
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h;
+}
+
+static int id_hash_init(IDHash* t, IDMap* map, int n) {
+    int cap = 16;
+    while (cap < 2 * n) cap <<= 1;      // keep the load factor under a half
+
+    t->cap = cap;
+    t->map = map;
+    t->slot = (int*)malloc(cap * sizeof(int));
+    if (!t->slot) return -1;
+
+    for (int i = 0; i < cap; i++) t->slot[i] = -1;
+    return 0;
+}
+
+static void id_hash_put(IDHash* t, int idx) {
+    unsigned int h = id_hash_of(t->map[idx].name) & (t->cap - 1);
+    while (t->slot[h] != -1) h = (h + 1) & (t->cap - 1);
+    t->slot[h] = idx;
+}
+
+static int id_hash_get(IDHash* t, const char* name) {
+    unsigned int h = id_hash_of(name) & (t->cap - 1);
+    while (t->slot[h] != -1) {
+        int idx = t->slot[h];
+        if (strcmp(t->map[idx].name, name) == 0) return t->map[idx].index;
+        h = (h + 1) & (t->cap - 1);
+    }
+    return -1;
+}
+
+static void id_hash_free(IDHash* t) { free(t->slot); }
 
 int read_gfa_graph(const char* filename, Graph* graph) {
     FILE *fp = fopen(filename, "r");
@@ -102,7 +157,15 @@ int read_gfa_graph(const char* filename, Graph* graph) {
 
     // Pass 3: Parse Links (Edges)
     rewind(fp);
-    
+
+    IDHash id_hash;
+    if (id_hash_init(&id_hash, id_map, node_count) != 0) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        fclose(fp);
+        return -1;
+    }
+    for (int i = 0; i < current_node; i++) id_hash_put(&id_hash, i);
+
     while (fgets(line, sizeof(line), fp)) {
         if (line[0] == 'L') {
             // GFA Format: L \t <From> \t <FromOrient> \t <To> \t <ToOrient> \t <Overlap> \t [Optional Tags]
@@ -114,8 +177,8 @@ int read_gfa_graph(const char* filename, Graph* graph) {
             char* overlap = strtok(NULL, "\t\n");
             
             if (from_name && to_name) {
-                int u_idx = get_node_index(id_map, node_count, from_name);
-                int v_idx = get_node_index(id_map, node_count, to_name);
+                int u_idx = id_hash_get(&id_hash, from_name);
+                int v_idx = id_hash_get(&id_hash, to_name);
 
                 if (u_idx != -1 && v_idx != -1) {
                     Node* source = &graph->nodes[u_idx];
@@ -137,6 +200,7 @@ int read_gfa_graph(const char* filename, Graph* graph) {
         }
     }
     
+    id_hash_free(&id_hash);
     free(id_map);
     fclose(fp);
     return 0;
@@ -399,14 +463,24 @@ static void print_usage(const char* program)
     fprintf(stderr, "   3 = parallel async\n");
     fprintf(stderr, "   4 = async monolithic\n");
     fprintf(stderr, "   5 = async batching\n");
-    fprintf(stderr, "   6 = shared mem\n");
-    fprintf(stderr, "   7 = persistent kernels\n");
+    fprintf(stderr, "   7 = shared mem\n");
+    fprintf(stderr, "   8 = last column only, traceback recomputed on the CPU\n");
+    fprintf(stderr, "   9 = warps (warp per node, shared mem)\n");
+    fprintf(stderr, "  10 = registers (warp per node, shuffles)\n");
+    fprintf(stderr, "  11 = persistent kernels (registers core, last column only)\n");
 
     fprintf(stderr, " Mode 2 (hybrid CPU-GPU), 0-%d:\n", HYBRID_MAX_VERSION);
     fprintf(stderr, "   0 = base (explicit copies)\n");
     fprintf(stderr, "   1 = unified (managed memory)\n");
     fprintf(stderr, "   2 = pinned\n");
     fprintf(stderr, "   3 = advised (managed memory, migration hints)\n");
+    fprintf(stderr, "   4 = warps on the dense levels, CPU on the tail (pinned last columns)\n");
+    fprintf(stderr, "   5 = registers on the dense levels, CPU on the tail (pinned last columns)\n");
+
+    fprintf(stderr, " Mode 4 (multiple sequences), 0-%d:\n", MULTI_MAX_VERSION);
+    fprintf(stderr, "   0 = warp per (node, read), set NUM_READS in the environment\n");
+    fprintf(stderr, "   1 = same, on the registers core (shuffles instead of shared diagonals)\n");
+    fprintf(stderr, "   1 = same, block pinned to one node so its bases are staged once\n");
 
     fprintf(stderr, " Mode 3 (no-copy, for DGX), 0-%d:\n", NOCOPY_MAX_VERSION);
     fprintf(stderr, "   0 = naive\n");
@@ -442,8 +516,9 @@ int main(int argc, char *argv[]) {
     bool GPU = (mode == 1);
     bool Hybrid = (mode == 2);
     bool NoCopy = (mode == 3);
+    bool Multi = (mode == 4);
 
-    if (!CPU && !GPU && !Hybrid && !NoCopy)
+    if (!CPU && !GPU && !Hybrid && !NoCopy && !Multi)
     {
         fprintf(stderr, "Invalid mode %d!\n", mode);
         print_usage((char*)argv[0]);
@@ -453,7 +528,8 @@ int main(int argc, char *argv[]) {
     bool valid = version >= 0 && ((CPU    && version <= CPU_MAX_VERSION)
                                || (GPU    && version <= GPU_MAX_VERSION)
                                || (Hybrid && version <= HYBRID_MAX_VERSION)
-                               || (NoCopy && version <= NOCOPY_MAX_VERSION));
+                               || (NoCopy && version <= NOCOPY_MAX_VERSION)
+                               || (Multi  && version <= MULTI_MAX_VERSION));
 
     if (!valid)
     {
@@ -494,7 +570,9 @@ int main(int argc, char *argv[]) {
     printf("Successfully loaded input, proceeding with verification run.\n");
 
     if (CPU) {
-        init_cpu_graph(&graph, sequence.size);
+        if      (version == 4) init_cpu_graph_multi_plain(&graph, sequence.size, 1);
+        else if (version == 5) init_cpu_graph_multi_plain(&graph, sequence.size, multi_num_reads());
+        else                   init_cpu_graph(&graph, sequence.size);
     }
     else if (GPU) {
         switch (version){
@@ -504,12 +582,19 @@ int main(int argc, char *argv[]) {
             case 3: init_cpu_graph_pinned(&graph, sequence.size); break;
             case 4: init_cpu_graph_pinned(&graph, sequence.size); break;
             case 5: init_cpu_graph_pinned(&graph, sequence.size); break;
-            case 6: init_cpu_graph_pinned(&graph, sequence.size); break;
+            // Reserved for a possible (future) 2bit version, seems to be a big thing
             case 7: init_cpu_graph_pinned(&graph, sequence.size); break;
+            case 8: init_cpu_graph_last_col(&graph, sequence.size); break;
+            case 9: init_cpu_graph_last_col(&graph, sequence.size); break;
+            case 10: init_cpu_graph_last_col(&graph, sequence.size); break;
+            case 11: init_cpu_graph_last_col(&graph, sequence.size); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
-        
-        init_gpu_graph(&graph, &cudaGraph, sequence.size);
+
+        // The last column versions keep a last column instead of full score matrices, so they lay
+        // the device side out differently as well.
+        if   (version == 8 || version == 9 || version == 10 || version == 11) init_gpu_graph_last_col(&graph, &cudaGraph, sequence.size);
+        else init_gpu_graph(&graph, &cudaGraph, sequence.size);
     }
     else if (Hybrid) {
         switch (version){
@@ -517,6 +602,8 @@ int main(int argc, char *argv[]) {
             case 1: init_unified_graph(&graph, &cudaGraph, sequence.size); break;
             case 2: init_pinned_graph(&graph, &cudaGraph, sequence.size); break;
             case 3: init_advised_graph(&graph, &cudaGraph, sequence.size); break;
+            case 4: init_pinned_graph_last_col(&graph, &cudaGraph, sequence.size); break;
+            case 5: init_pinned_graph_last_col(&graph, &cudaGraph, sequence.size); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }
@@ -524,6 +611,10 @@ int main(int argc, char *argv[]) {
         if (version < 0 || version > 6) { fprintf(stderr, "Unspecified No-copy version!\n"); return -4; }
 
         init_shared_graph(&graph, &cudaGraph, sequence.size);
+    }
+    else if (Multi) {
+        init_cpu_graph_multi(&graph, sequence.size, multi_num_reads());
+        init_gpu_graph_multi(&graph, &cudaGraph, sequence.size, multi_num_reads());
     }
     else {
         fprintf(stderr, "Still not implemented!\n"); return -4;
@@ -540,6 +631,8 @@ int main(int argc, char *argv[]) {
             case 1: res = cpu_align_simd(graph, sequence); break;
             case 2: res = cpu_align_simd_parallel_dp(graph, sequence); break;
             case 3: res = cpu_align_simd_parallel_node(graph, sequence); break;
+            case 4: res = cpu_align_last_col(graph, sequence); break;
+            case 5: res = cpu_align_multi(graph, sequence); break;
             default: fprintf(stderr, "Unspecified CPU version!\n"); return -4;
         }
     }
@@ -552,8 +645,11 @@ int main(int argc, char *argv[]) {
             case 3: res = gpu_align_parallel_async(graph, cudaGraph, sequence); break;
             case 4: res = gpu_align_async_monolithic(graph, cudaGraph, sequence); break;
             case 5: res = gpu_align_async_batching(graph, cudaGraph, sequence); break;
-            case 6: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
-            case 7: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
+            case 7: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
+            case 8: res = gpu_align_last_col(graph, cudaGraph, sequence); break;
+            case 9: res = gpu_align_warps(graph, cudaGraph, sequence); break;
+            case 10: res = gpu_align_registers(graph, cudaGraph, sequence); break;
+            case 11: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
     }
@@ -564,7 +660,17 @@ int main(int argc, char *argv[]) {
             case 1: res = gpu_align_hybrid_unified(graph, cudaGraph, sequence); break;
             case 2: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
             case 3: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
+            case 4: res = gpu_align_hybrid_warps(graph, cudaGraph, sequence); break;
+            case 5: res = gpu_align_hybrid_registers(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
+        }
+    }
+    else if (Multi)
+    {
+        switch (version){
+            case 0: res = gpu_align_multi(graph, cudaGraph, sequence); break;
+            case 1: res = gpu_align_multi_registers(graph, cudaGraph, sequence); break;
+            default: fprintf(stderr, "Unspecified Multi version!\n"); return -4;
         }
     }
     else if (NoCopy)
@@ -602,6 +708,8 @@ int main(int argc, char *argv[]) {
                 case 1: res = cpu_align_simd(graph, sequence); break;
                 case 2: res = cpu_align_simd_parallel_dp(graph, sequence); break;
                 case 3: res = cpu_align_simd_parallel_node(graph, sequence); break;
+                case 4: res = cpu_align_last_col(graph, sequence); break;
+            case 5: res = cpu_align_multi(graph, sequence); break;
                 default: fprintf(stderr, "Unspecified CPU version!\n"); return -4;
             }
         }
@@ -614,8 +722,11 @@ int main(int argc, char *argv[]) {
                 case 3: res = gpu_align_parallel_async(graph, cudaGraph, sequence); break;
                 case 4: res = gpu_align_async_monolithic(graph, cudaGraph, sequence); break;
                 case 5: res = gpu_align_async_batching(graph, cudaGraph, sequence); break;
-                case 6: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
-                case 7: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
+                case 7: res = gpu_align_shared_mem(graph, cudaGraph, sequence); break;
+                case 8: res = gpu_align_last_col(graph, cudaGraph, sequence); break;
+                case 9: res = gpu_align_warps(graph, cudaGraph, sequence); break;
+                case 10: res = gpu_align_registers(graph, cudaGraph, sequence); break;
+                case 11: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }
@@ -626,7 +737,17 @@ int main(int argc, char *argv[]) {
                 case 1: res = gpu_align_hybrid_unified(graph, cudaGraph, sequence); break;
                 case 2: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
                 case 3: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
+                case 4: res = gpu_align_hybrid_warps(graph, cudaGraph, sequence); break;
+                case 5: res = gpu_align_hybrid_registers(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
+            }
+        }
+        else if (Multi)
+        {
+            switch (version){
+                case 0: res = gpu_align_multi(graph, cudaGraph, sequence); break;
+                case 1: res = gpu_align_multi_registers(graph, cudaGraph, sequence); break;
+                default: fprintf(stderr, "Unspecified Multi version!\n"); return -4;
             }
         }
         else if (NoCopy)
@@ -659,7 +780,8 @@ int main(int argc, char *argv[]) {
     //fprintf(stdout, "My GEMM-COO bandwidth %lf GB/s\n", bandwidth_coo);
 
     if (CPU) {
-        free_cpu_graph(&graph);
+        if (version == 4 || version == 5) free_cpu_graph_multi_plain(&graph);
+        else                               free_cpu_graph(&graph);
     }
     else if (GPU) {
         switch (version){
@@ -669,12 +791,16 @@ int main(int argc, char *argv[]) {
             case 3: free_cpu_graph_pinned(&graph); break;
             case 4: free_cpu_graph_pinned(&graph); break;
             case 5: free_cpu_graph_pinned(&graph); break;
-            case 6: free_cpu_graph_pinned(&graph); break;
             case 7: free_cpu_graph_pinned(&graph); break;
+            case 8: free_cpu_graph_last_col(&graph); break;
+            case 9: free_cpu_graph_last_col(&graph); break;
+            case 10: free_cpu_graph_last_col(&graph); break;
+            case 11: free_cpu_graph_last_col(&graph); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
-        
-        free_gpu_graph(&cudaGraph);
+
+        if   (version == 8 || version == 9 || version == 10 || version == 11) free_gpu_graph_last_col(&cudaGraph);
+        else free_gpu_graph(&cudaGraph);
     }
     else if (Hybrid) {
         switch (version){
@@ -682,11 +808,17 @@ int main(int argc, char *argv[]) {
             case 1: free_unified_graph(&graph, &cudaGraph); break;
             case 2: free_pinned_graph(&graph, &cudaGraph); break;
             case 3: free_advised_graph(&graph, &cudaGraph); break;
+            case 4: free_pinned_graph_last_col(&graph, &cudaGraph); break;
+            case 5: free_pinned_graph_last_col(&graph, &cudaGraph); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }
     else if (NoCopy) {
         free_shared_graph(&graph, &cudaGraph);
+    }
+    else if (Multi) {
+        free_gpu_graph_multi(&cudaGraph);
+        free_cpu_graph_multi(&graph);
     }
     else {
         fprintf(stderr, "Still not implemented!\n"); return -4;

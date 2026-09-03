@@ -4,8 +4,8 @@ Timing sweep over bin/main: runs every requested (dataset, mode, version) combin
 per iteration timings that main.c prints, and writes one tidy CSV row per iteration.
 
     python3 tools/benchmark.py                                   # defaults
-    python3 tools/benchmark.py -d 500_10 150_10 -g 4 5 6         # pick datasets / GPU versions
-    python3 tools/benchmark.py --cpu 0 1 2 3 --gpu 0 2 3 4 5 6 --hybrid 0 1
+    python3 tools/benchmark.py -d 500_10 150_10 -g 4 5 7         # pick datasets / GPU versions
+    python3 tools/benchmark.py --cpu 0 1 2 3 --gpu 0 2 3 4 5 7 --hybrid 0 1
     python3 tools/benchmark.py -o outputs/timings.csv
 
 CSV columns: dataset,mode,version,label,iter,time_s,align_len,identity
@@ -22,9 +22,11 @@ import re
 import subprocess
 import sys
 
-CPU_LABELS = {0: "sequential", 1: "simd", 2: "simd_parallel_dp", 3: "simd_parallel_node"}
+CPU_LABELS = {0: "sequential", 1: "simd", 2: "simd_parallel_dp", 3: "simd_parallel_node",
+              4: "last_col", 5: "multi"}
 GPU_LABELS = {0: "naive", 1: "naive(pinned)", 2: "parallel_node", 3: "parallel_async",
-              4: "async_monolithic", 5: "async_batching", 6: "shared_mem"}
+              4: "async_monolithic", 5: "async_batching", 7: "shared_mem",
+              8: "last_col", 9: "warps", 10: "registers", 11: "persistent_kernels"}
 HYBRID_LABELS = {0: "hybrid_base", 1: "hybrid_unified", 2: "hybrid_pinned",
                  3: "hybrid_advised"}
 NOCOPY_LABELS = {0: "nc_naive", 1: "nc_naive", 2: "nc_level", 3: "nc_level", 4: "nc_level",
@@ -68,7 +70,7 @@ def main():
                     default=["150_10_small", "500_10", "150_10"])
     ap.add_argument("--cpu", nargs="*", type=int, default=[0, 1, 2, 3],
                     help="CPU versions to run (mode 0), empty to skip")
-    ap.add_argument("-g", "--gpu", nargs="*", type=int, default=[0, 2, 3, 4, 5, 6],
+    ap.add_argument("-g", "--gpu", nargs="*", type=int, default=[0, 2, 3, 4, 5, 7],
                     help="GPU versions to run (mode 1), empty to skip")
     ap.add_argument("--hybrid", nargs="*", type=int, default=[0, 1, 2, 3],
                     help="hybrid versions to run (mode 2), empty to skip")

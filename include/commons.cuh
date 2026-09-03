@@ -162,6 +162,174 @@ int free_gpu_graph(Graph* cudaGraph)
 }
 
 
+// *************************************************************************************************
+//
+//                              Last column graph (mode 1, v7 v8 v9)
+//
+// *************************************************************************************************
+//
+// The forward pass of the last column versions keeps no matrix at all. A node hands its successors
+// one thing, the M + 1 scores of its rightmost column, and that is the only thing that has to
+// survive it: 151 ints a node, 30 MB for 150_10, against the 7.80 GB the score matrices took. The
+// alignment itself is recovered afterwards by recomputing the two or three nodes the path actually
+// crosses, on the CPU, which is why nothing else is stored.
+//
+// Both sides are one contiguous allocation of num_nodes * (seqSize + 1) ints, zeroed once so that
+// last_col[0], the top row, is already the zero the recurrence wants.
+
+int init_cpu_graph_last_col(Graph* graph, int seqSize)
+{
+    size_t total_cols = (size_t)graph->num_nodes * (seqSize + 1);
+
+    DTYPEMATRIX* cols = NULL;
+    if (cudaMallocHost((void**)&cols, total_cols * sizeof(DTYPEMATRIX)) != cudaSuccess) return -1;
+
+    memset(cols, 0, total_cols * sizeof(DTYPEMATRIX));
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        graph->nodes[n].last_col  = cols;
+        graph->nodes[n].dp_matrix = NULL;
+
+        cols += (seqSize + 1);
+    }
+
+    return 0;
+}
+
+int free_cpu_graph_last_col(Graph* graph)
+{
+    if (graph->num_nodes > 0) cudaFreeHost(graph->nodes[0].last_col);
+
+    for (int i = 0; i < graph->num_nodes; i++) {
+        free(graph->nodes[i].sequence.sequence);
+        if (graph->nodes[i].v_in) free(graph->nodes[i].v_in);
+        if (graph->nodes[i].v_out) free(graph->nodes[i].v_out);
+    }
+    free(graph->nodes);
+
+    return 0;
+}
+
+int init_gpu_graph_last_col(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    cudaError_t cudaStatus;
+
+    cudaGraph->num_nodes = graph->num_nodes;
+    cudaGraph->max_score = graph->max_score;
+    cudaGraph->max_score_node_id = graph->max_score_node_id;
+
+    Node* device_nodes = (Node*)malloc(graph->num_nodes * sizeof(Node));
+    if (device_nodes == NULL) { return -1; }
+
+    size_t total_cols = (size_t)graph->num_nodes * (seqSize + 1);
+
+    DTYPEMATRIX* lastcols = NULL;
+
+    cudaStatus = cudaMalloc((void**)&lastcols, total_cols * sizeof(DTYPEMATRIX));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "last_col allocation failed!\n"); return -2; }
+
+    cudaMemset(lastcols, 0, total_cols * sizeof(DTYPEMATRIX));
+
+    DTYPEMATRIX* col_walk = lastcols;
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* d_node = &device_nodes[n];
+
+        d_node->id = h_node->id;
+        d_node->num_in = h_node->num_in;
+        d_node->num_out = h_node->num_out;
+
+        d_node->dp_matrix = NULL;
+        d_node->last_col  = col_walk;
+
+        col_walk += (seqSize + 1);
+
+        d_node->sequence.size = h_node->sequence.size;
+        cudaStatus = cudaMalloc((void**)&d_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET));
+        if (cudaStatus != cudaSuccess) { fprintf(stderr, "sequence allocation failed!\n"); return -2; }
+
+        cudaStatus = cudaMemcpy(d_node->sequence.sequence, h_node->sequence.sequence,
+                                h_node->sequence.size * sizeof(DTYPEALPHABET), cudaMemcpyHostToDevice);
+        if (cudaStatus != cudaSuccess) { fprintf(stderr, "sequence memcpy failed!\n"); return -3; }
+
+        if (h_node->num_in > 0) {
+            cudaStatus = cudaMalloc((void**)&d_node->v_in, h_node->num_in * sizeof(Node*));
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            d_node->v_in = NULL;
+        }
+
+        if (h_node->num_out > 0) {
+            cudaStatus = cudaMalloc((void**)&d_node->v_out, h_node->num_out * sizeof(Node*));
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            d_node->v_out = NULL;
+        }
+    }
+
+    cudaStatus = cudaMalloc((void**)&cudaGraph->nodes, graph->num_nodes * sizeof(Node));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaGraph->nodes allocation failed!\n"); return -2; }
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* d_node = &device_nodes[n];
+
+        if (h_node->num_in > 0) {
+            Node** tmp_v_in = (Node**)malloc(h_node->num_in * sizeof(Node*));
+            for (int i = 0; i < h_node->num_in; i++)
+                tmp_v_in[i] = &cudaGraph->nodes[h_node->v_in[i]->id];
+            cudaMemcpy(d_node->v_in, tmp_v_in, h_node->num_in * sizeof(Node*), cudaMemcpyHostToDevice);
+            free(tmp_v_in);
+        }
+
+        if (h_node->num_out > 0) {
+            Node** tmp_v_out = (Node**)malloc(h_node->num_out * sizeof(Node*));
+            for (int i = 0; i < h_node->num_out; i++)
+                tmp_v_out[i] = &cudaGraph->nodes[h_node->v_out[i]->id];
+            cudaMemcpy(d_node->v_out, tmp_v_out, h_node->num_out * sizeof(Node*), cudaMemcpyHostToDevice);
+            free(tmp_v_out);
+        }
+    }
+
+    cudaStatus = cudaMemcpy(cudaGraph->nodes, device_nodes, graph->num_nodes * sizeof(Node), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "Final nodes array copy failed!\n"); return -3; }
+
+    free(device_nodes);
+
+    return 0;
+}
+
+int free_gpu_graph_last_col(Graph* cudaGraph)
+{
+    Node* device_nodes = (Node*)malloc(cudaGraph->num_nodes * sizeof(Node));
+
+    cudaError_t status = cudaMemcpy(device_nodes, cudaGraph->nodes,
+                                    cudaGraph->num_nodes * sizeof(Node),
+                                    cudaMemcpyDeviceToHost);
+
+    if (status != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed during free routine. Memory might leak!\n");
+        free(device_nodes);
+        return -1;
+    }
+
+    cudaFree(device_nodes[0].last_col);
+
+    for (int n = 0; n < cudaGraph->num_nodes; n++) {
+        cudaFree(device_nodes[n].sequence.sequence);
+        cudaFree(device_nodes[n].v_in);
+        cudaFree(device_nodes[n].v_out);
+    }
+
+    cudaFree(cudaGraph->nodes);
+    free(device_nodes);
+
+    cudaGraph->num_nodes = 0;
+
+    return 0;
+}
+
 int init_cpu_graph_pinned(Graph* graph, int seqSize) 
 {
 
@@ -401,6 +569,270 @@ int init_pinned_graph(Graph* graph, Graph* cudaGraph, int seqSize)
     cudaGraph->num_nodes = graph->num_nodes;
     cudaGraph->max_score = graph->max_score;
     cudaGraph->max_score_node_id = graph->max_score_node_id;
+
+    return 0;
+}
+
+// *************************************************************************************************
+//
+//                             Multi sequence graph (mode 4)
+//
+// *************************************************************************************************
+//
+// Same as the last column graph, with a read dimension: a node carries num_reads last columns
+// instead of one, laid out read after read so that consecutive warps of the kernel, which take
+// consecutive reads of the same node, land on neighbouring slices. R * 30 MB for 150_10, which is
+// the reason the batch is possible at all - the score matrices were 7.80 GB a read.
+
+int init_cpu_graph_multi(Graph* graph, int seqSize, int num_reads)
+{
+    size_t total = (size_t)graph->num_nodes * num_reads * (seqSize + 1);
+
+    DTYPEMATRIX* cols = NULL;
+    if (cudaMallocHost((void**)&cols, total * sizeof(DTYPEMATRIX)) != cudaSuccess) return -1;
+
+    memset(cols, 0, total * sizeof(DTYPEMATRIX));
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        graph->nodes[n].last_col  = cols;
+        graph->nodes[n].dp_matrix = NULL;
+
+        cols += (size_t)num_reads * (seqSize + 1);
+    }
+
+    return 0;
+}
+
+// Plain host allocation of the same layout, for the CPU baseline of mode 0. Nothing on that path
+// ever touches the device, so page locking the pages would only make a large batch fail to
+// allocate for no benefit.
+
+int init_cpu_graph_multi_plain(Graph* graph, int seqSize, int num_reads)
+{
+    size_t total = (size_t)graph->num_nodes * num_reads * (seqSize + 1);
+
+    DTYPEMATRIX* cols = (DTYPEMATRIX*)calloc(total, sizeof(DTYPEMATRIX));
+    if (cols == NULL) return -1;
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        graph->nodes[n].last_col  = cols;
+        graph->nodes[n].dp_matrix = NULL;
+
+        cols += (size_t)num_reads * (seqSize + 1);
+    }
+
+    return 0;
+}
+
+int free_cpu_graph_multi_plain(Graph* graph)
+{
+    if (graph->num_nodes > 0) free(graph->nodes[0].last_col);
+
+    for (int i = 0; i < graph->num_nodes; i++) {
+        free(graph->nodes[i].sequence.sequence);
+        if (graph->nodes[i].v_in) free(graph->nodes[i].v_in);
+        if (graph->nodes[i].v_out) free(graph->nodes[i].v_out);
+    }
+    free(graph->nodes);
+
+    return 0;
+}
+
+int free_cpu_graph_multi(Graph* graph)
+{
+    return free_cpu_graph_last_col(graph);
+}
+
+int init_gpu_graph_multi(Graph* graph, Graph* cudaGraph, int seqSize, int num_reads)
+{
+    cudaError_t cudaStatus;
+
+    cudaGraph->num_nodes = graph->num_nodes;
+
+    Node* device_nodes = (Node*)malloc(graph->num_nodes * sizeof(Node));
+    if (device_nodes == NULL) { return -1; }
+
+    size_t total = (size_t)graph->num_nodes * num_reads * (seqSize + 1);
+
+    DTYPEMATRIX* lastcols = NULL;
+    cudaStatus = cudaMalloc((void**)&lastcols, total * sizeof(DTYPEMATRIX));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "last_col allocation failed!\n"); return -2; }
+
+    cudaMemset(lastcols, 0, total * sizeof(DTYPEMATRIX));
+
+    DTYPEMATRIX* col_walk = lastcols;
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* d_node = &device_nodes[n];
+
+        d_node->id = h_node->id;
+        d_node->num_in = h_node->num_in;
+        d_node->num_out = h_node->num_out;
+
+        d_node->dp_matrix = NULL;
+        d_node->last_col  = col_walk;
+
+        col_walk += (size_t)num_reads * (seqSize + 1);
+
+        d_node->sequence.size = h_node->sequence.size;
+        cudaStatus = cudaMalloc((void**)&d_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET));
+        if (cudaStatus != cudaSuccess) { fprintf(stderr, "sequence allocation failed!\n"); return -2; }
+
+        cudaMemcpy(d_node->sequence.sequence, h_node->sequence.sequence,
+                   h_node->sequence.size * sizeof(DTYPEALPHABET), cudaMemcpyHostToDevice);
+
+        if (h_node->num_in > 0) {
+            cudaMalloc((void**)&d_node->v_in, h_node->num_in * sizeof(Node*));
+        } else d_node->v_in = NULL;
+
+        if (h_node->num_out > 0) {
+            cudaMalloc((void**)&d_node->v_out, h_node->num_out * sizeof(Node*));
+        } else d_node->v_out = NULL;
+    }
+
+    cudaStatus = cudaMalloc((void**)&cudaGraph->nodes, graph->num_nodes * sizeof(Node));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "cudaGraph->nodes allocation failed!\n"); return -2; }
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* d_node = &device_nodes[n];
+
+        if (h_node->num_in > 0) {
+            Node** tmp_v_in = (Node**)malloc(h_node->num_in * sizeof(Node*));
+            for (int i = 0; i < h_node->num_in; i++) tmp_v_in[i] = &cudaGraph->nodes[h_node->v_in[i]->id];
+            cudaMemcpy(d_node->v_in, tmp_v_in, h_node->num_in * sizeof(Node*), cudaMemcpyHostToDevice);
+            free(tmp_v_in);
+        }
+
+        if (h_node->num_out > 0) {
+            Node** tmp_v_out = (Node**)malloc(h_node->num_out * sizeof(Node*));
+            for (int i = 0; i < h_node->num_out; i++) tmp_v_out[i] = &cudaGraph->nodes[h_node->v_out[i]->id];
+            cudaMemcpy(d_node->v_out, tmp_v_out, h_node->num_out * sizeof(Node*), cudaMemcpyHostToDevice);
+            free(tmp_v_out);
+        }
+    }
+
+    cudaMemcpy(cudaGraph->nodes, device_nodes, graph->num_nodes * sizeof(Node), cudaMemcpyHostToDevice);
+    free(device_nodes);
+
+    return 0;
+}
+
+int free_gpu_graph_multi(Graph* cudaGraph)
+{
+    return free_gpu_graph_last_col(cudaGraph);
+}
+
+// *************************************************************************************************
+//
+//                          Pinned last column graph (mode 2, v4 v5)
+//
+// *************************************************************************************************
+//
+// One shared graph in pinned host memory, like init_pinned_graph, carrying last columns instead of
+// score matrices. Unified addressing lets the kernels dereference these pointers directly and the
+// page locked pages never migrate, so a hand over between a GPU level and a CPU level costs one
+// stream synchronise and no copy at all. What crosses the boundary is 604 bytes a node, which is
+// why pinned memory is enough here and nothing more elaborate is needed.
+
+int init_pinned_graph_last_col(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    cudaError_t cudaStatus;
+
+    Node* pinned_nodes = NULL;
+    cudaStatus = cudaMallocHost((void**)&pinned_nodes, graph->num_nodes * sizeof(Node));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "pinned nodes allocation failed!\n"); return -2; }
+
+    size_t total_cols = (size_t)graph->num_nodes * (seqSize + 1);
+
+    DTYPEMATRIX* lastcols = NULL;
+    cudaStatus = cudaMallocHost((void**)&lastcols, total_cols * sizeof(DTYPEMATRIX));
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "last_col allocation failed!\n"); return -2; }
+
+    memset(lastcols, 0, total_cols * sizeof(DTYPEMATRIX));
+
+    DTYPEMATRIX* col_walk = lastcols;
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* p_node = &pinned_nodes[n];
+
+        p_node->id = h_node->id;
+        p_node->depth = h_node->depth;
+        p_node->num_in = h_node->num_in;
+        p_node->num_out = h_node->num_out;
+
+        p_node->dp_matrix = NULL;
+        p_node->last_col = col_walk;
+
+        col_walk += (seqSize + 1);
+
+        p_node->sequence.size = h_node->sequence.size;
+        cudaStatus = cudaMallocHost((void**)&p_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET));
+        if (cudaStatus != cudaSuccess) { fprintf(stderr, "sequence allocation failed!\n"); return -2; }
+
+        memcpy(p_node->sequence.sequence, h_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET));
+
+        if (h_node->num_in > 0) {
+            cudaStatus = cudaMallocHost((void**)&p_node->v_in, h_node->num_in * sizeof(Node*));
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            p_node->v_in = NULL;
+        }
+
+        if (h_node->num_out > 0) {
+            cudaStatus = cudaMallocHost((void**)&p_node->v_out, h_node->num_out * sizeof(Node*));
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            p_node->v_out = NULL;
+        }
+    }
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* p_node = &pinned_nodes[n];
+
+        for (int i = 0; i < h_node->num_in; i++)
+            p_node->v_in[i] = &pinned_nodes[h_node->v_in[i]->id];
+
+        for (int i = 0; i < h_node->num_out; i++)
+            p_node->v_out[i] = &pinned_nodes[h_node->v_out[i]->id];
+    }
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        free(graph->nodes[n].sequence.sequence);
+        free(graph->nodes[n].v_in);
+        free(graph->nodes[n].v_out);
+    }
+    free(graph->nodes);
+
+    graph->nodes = pinned_nodes;
+
+    cudaGraph->nodes = pinned_nodes;
+    cudaGraph->num_nodes = graph->num_nodes;
+    cudaGraph->max_score = graph->max_score;
+    cudaGraph->max_score_node_id = graph->max_score_node_id;
+
+    return 0;
+}
+
+int free_pinned_graph_last_col(Graph* graph, Graph* cudaGraph)
+{
+    if (graph->num_nodes > 0) cudaFreeHost(graph->nodes[0].last_col);
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        cudaFreeHost(graph->nodes[n].sequence.sequence);
+        cudaFreeHost(graph->nodes[n].v_in);
+        cudaFreeHost(graph->nodes[n].v_out);
+    }
+
+    cudaFreeHost(graph->nodes);
+
+    graph->nodes = NULL;
+    graph->num_nodes = 0;
+    cudaGraph->nodes = NULL;
+    cudaGraph->num_nodes = 0;
 
     return 0;
 }

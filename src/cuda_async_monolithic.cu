@@ -1,5 +1,11 @@
 #include "../include/cuda_async_monolithic.cuh"
 
+// *************************************************************************************************
+//
+//                                           Scheduler
+//
+// *************************************************************************************************
+
 AlignmentResult gpu_align_async_monolithic(Graph graph, Graph cudaGraph, Sequence sequence)
 {
     Sequence sequence_rev;

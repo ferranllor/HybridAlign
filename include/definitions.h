@@ -8,14 +8,15 @@
 #pragma once
 
 #define DTYPEALPHABET char
-#define DTYPEMATRIX int
+#define DTYPEMATRIX short
 
 // Highest valid version for each mode, used by main.c to validate the arguments and to print the
 // usage. Bump these when a new version is added to the switches in main.c.
-#define CPU_MAX_VERSION    3
-#define GPU_MAX_VERSION    7
-#define HYBRID_MAX_VERSION 3
+#define CPU_MAX_VERSION    5
+#define GPU_MAX_VERSION    11
+#define HYBRID_MAX_VERSION 5
 #define NOCOPY_MAX_VERSION 6
+#define MULTI_MAX_VERSION  1
 
 #define WARMUP 1
 #define NITER 3
@@ -59,6 +60,9 @@ typedef struct Node {
 
     Sequence sequence;
     DTYPEMATRIX* dp_matrix;
+
+    // The one column of scores a successor has to read to seed its own boundary, used by the last column versions instead of dp_matrix.
+    DTYPEMATRIX* last_col;
 
     int max_score; int max_score_i; int max_score_j; int max_score_d;
 } Node;

@@ -2,10 +2,10 @@
 # ------------------------------------------------------------------------------------------------
 # Correctness sweep: every GPU version against the CPU sequential reference, on every dataset,
 # optionally for several BLOCKSIZE values (that is what exercises the banding/striding of
-# version 6 - a band is only split when BLOCKSIZE < min(M, N)).
+# version 8 - a band is only split when BLOCKSIZE < min(M, N)).
 #
 #   tools/verify.sh                                   # default datasets, default BLOCKSIZE
-#   tools/verify.sh -d "30_5 500_10" -v "1:5 1:6"     # pick datasets / versions
+#   tools/verify.sh -d "30_5 500_10" -v "1:5 1:8"     # pick datasets / versions
 #   tools/verify.sh -v "2:0"                          # hybrid only (versions are mode:version)
 #   tools/verify.sh -b "16 64 100 480"                # sweep BLOCKSIZE (rebuilds the harness)
 #   tools/verify.sh -o outputs/verify.csv             # where the CSV goes
@@ -15,7 +15,7 @@
 set -u
 
 DATASETS="5_15 20_10 30_5 150_10_small 500_10"
-VERSIONS="1:0 1:2 1:3 1:4 1:5 1:6 2:0 2:1 2:2 2:3 3:0 3:2 3:6"
+VERSIONS="1:0 1:2 1:3 1:4 1:5 1:7 1:8 1:9 1:10 2:0 2:1 2:2 2:3 3:0 3:2 3:6"
 BLOCKSIZES=""                       # empty -> whatever include/cuda_utils.cuh defines
 OUT="outputs/verify.csv"
 
