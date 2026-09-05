@@ -5,7 +5,7 @@
 # since SHARED_MEM_KIND is read from the environment, not passed as a CLI version number.
 # Meant to be run once per machine (Baldo, DGX Spark) for the evaluation's No-copy table.
 #
-#   tools/bench_nocopy.sh                              # default dataset 150_10, versions 0 2 6
+#   tools/bench_nocopy.sh                              # default dataset 150_10, versions 0 2 6-10
 #   tools/bench_nocopy.sh -d 500_10 -v "0 6"
 #   tools/bench_nocopy.sh -n 5 -o outputs/nocopy
 #
@@ -17,7 +17,7 @@ set -u
 export LC_ALL=C
 
 DATASET="150_10"
-VERSIONS="0 2 6"
+VERSIONS="0 2 6 7 8 9 10"
 REPEATS=3
 KINDS="advised pinned managed"
 OUT="outputs/nocopy"

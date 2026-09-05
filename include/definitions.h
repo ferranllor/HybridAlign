@@ -15,7 +15,7 @@
 #define CPU_MAX_VERSION    5
 #define GPU_MAX_VERSION    11
 #define HYBRID_MAX_VERSION 5
-#define NOCOPY_MAX_VERSION 6
+#define NOCOPY_MAX_VERSION 10
 #define MULTI_MAX_VERSION  1
 
 #define WARMUP 1

@@ -28,9 +28,10 @@ GPU_LABELS = {0: "naive", 1: "naive(pinned)", 2: "parallel_node", 3: "parallel_a
               4: "async_monolithic", 5: "async_batching", 7: "shared_mem",
               8: "last_col", 9: "warps", 10: "registers", 11: "persistent_kernels"}
 HYBRID_LABELS = {0: "hybrid_base", 1: "hybrid_unified", 2: "hybrid_pinned",
-                 3: "hybrid_advised"}
+                 3: "hybrid_advised", 4: "hybrid_warps", 5: "hybrid_registers"}
 NOCOPY_LABELS = {0: "nc_naive", 1: "nc_naive", 2: "nc_level", 3: "nc_level", 4: "nc_level",
-                 5: "nc_level", 6: "nc_shared_mem"}
+                 5: "nc_level", 6: "nc_shared_mem", 7: "nc_last_col", 8: "nc_warps",
+                 9: "nc_registers", 10: "nc_persistent_kernels"}
 
 ITER_RE = re.compile(r"Iteration\s+(-?\d+)\s+took\s+([0-9.eE+-]+)s")
 LEN_RE = re.compile(r"Alignment Length:\s*(\d+)")
@@ -74,7 +75,7 @@ def main():
                     help="GPU versions to run (mode 1), empty to skip")
     ap.add_argument("--hybrid", nargs="*", type=int, default=[0, 1, 2, 3],
                     help="hybrid versions to run (mode 2), empty to skip")
-    ap.add_argument("--nocopy", nargs="*", type=int, default=[0, 2, 6],
+    ap.add_argument("--nocopy", nargs="*", type=int, default=[0, 2, 6, 7, 8, 9, 10],
                     help="no-copy GPU versions to run (mode 3), empty to skip")
     ap.add_argument("-o", "--out", default="outputs/timings.csv")
     ap.add_argument("-t", "--timeout", type=int, default=3600)

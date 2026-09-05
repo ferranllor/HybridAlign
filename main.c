@@ -490,6 +490,10 @@ static void print_usage(const char* program)
     fprintf(stderr, "   4 = level\n");
     fprintf(stderr, "   5 = level\n");
     fprintf(stderr, "   6 = shared mem\n");
+    fprintf(stderr, "   7 = last column only, traceback recomputed on the CPU\n");
+    fprintf(stderr, "   8 = warps (warp per node, shared mem)\n");
+    fprintf(stderr, "   9 = registers (warp per node, shuffles)\n");
+    fprintf(stderr, "  10 = persistent kernels (registers core, last column only)\n");
 }
 
 // *************************************************************************************************
@@ -608,9 +612,12 @@ int main(int argc, char *argv[]) {
         }
     }
     else if (NoCopy) {
-        if (version < 0 || version > 6) { fprintf(stderr, "Unspecified No-copy version!\n"); return -4; }
+        if (version < 0 || version > NOCOPY_MAX_VERSION) { fprintf(stderr, "Unspecified No-copy version!\n"); return -4; }
 
-        init_shared_graph(&graph, &cudaGraph, sequence.size);
+        // Same split as mode 1: versions 7 and up keep a last column per node instead of a full
+        // score matrix, so the shared graph is laid out for them.
+        if   (version >= 7) init_shared_graph_last_col(&graph, &cudaGraph, sequence.size);
+        else init_shared_graph(&graph, &cudaGraph, sequence.size);
     }
     else if (Multi) {
         init_cpu_graph_multi(&graph, sequence.size, multi_num_reads());
@@ -679,6 +686,10 @@ int main(int argc, char *argv[]) {
             case 0: case 1: res = gpu_align_no_copy_naive(graph, cudaGraph, sequence); break;
             case 2: case 3: case 4: case 5: res = gpu_align_no_copy_level(graph, cudaGraph, sequence); break;
             case 6: res = gpu_align_no_copy_shared_mem(graph, cudaGraph, sequence); break;
+            case 7: res = gpu_align_no_copy_last_col(graph, cudaGraph, sequence); break;
+            case 8: res = gpu_align_no_copy_warps(graph, cudaGraph, sequence); break;
+            case 9: res = gpu_align_no_copy_registers(graph, cudaGraph, sequence); break;
+            case 10: res = gpu_align_no_copy_persistent_kernels(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified No-copy version!\n"); return -4;
         }
     }
@@ -756,6 +767,10 @@ int main(int argc, char *argv[]) {
                 case 0: case 1: res = gpu_align_no_copy_naive(graph, cudaGraph, sequence); break;
                 case 2: case 3: case 4: case 5: res = gpu_align_no_copy_level(graph, cudaGraph, sequence); break;
                 case 6: res = gpu_align_no_copy_shared_mem(graph, cudaGraph, sequence); break;
+                case 7: res = gpu_align_no_copy_last_col(graph, cudaGraph, sequence); break;
+                case 8: res = gpu_align_no_copy_warps(graph, cudaGraph, sequence); break;
+                case 9: res = gpu_align_no_copy_registers(graph, cudaGraph, sequence); break;
+                case 10: res = gpu_align_no_copy_persistent_kernels(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified No-copy version!\n"); return -4;
             }
         }
@@ -814,7 +829,8 @@ int main(int argc, char *argv[]) {
         }
     }
     else if (NoCopy) {
-        free_shared_graph(&graph, &cudaGraph);
+        if   (version >= 7) free_shared_graph_last_col(&graph, &cudaGraph);
+        else free_shared_graph(&graph, &cudaGraph);
     }
     else if (Multi) {
         free_gpu_graph_multi(&cudaGraph);

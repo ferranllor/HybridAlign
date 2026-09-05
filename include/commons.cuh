@@ -926,6 +926,136 @@ int free_advised_graph(Graph* graph, Graph* cudaGraph)
     return free_unified_graph(graph, cudaGraph);
 }
 
+// *************************************************************************************************
+//
+//                          Shared graph, last column layout (mode 3)
+//
+// *************************************************************************************************
+//
+// Same idea as init_unified_graph / init_pinned_graph, but carrying one last column per node
+// instead of a full score matrix, which is what the last column, warps, registers and persistent
+// kernel cores expect. 30 MB instead of 7.8 GB for 150_10, and since the graph is shared there is
+// nothing to copy back before the traceback recomputes the few nodes it walks.
+
+int init_unified_graph_last_col(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    cudaError_t cudaStatus;
+
+    Node* unified_nodes = NULL;
+    cudaStatus = cudaMallocManaged((void**)&unified_nodes, graph->num_nodes * sizeof(Node), cudaMemAttachGlobal);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "unified nodes allocation failed!\n"); return -2; }
+
+    size_t total_cols = (size_t)graph->num_nodes * (seqSize + 1);
+
+    DTYPEMATRIX* lastcols = NULL;
+    cudaStatus = cudaMallocManaged((void**)&lastcols, total_cols * sizeof(DTYPEMATRIX), cudaMemAttachGlobal);
+    if (cudaStatus != cudaSuccess) { fprintf(stderr, "last_col allocation failed!\n"); return -2; }
+
+    memset(lastcols, 0, total_cols * sizeof(DTYPEMATRIX));
+
+    DTYPEMATRIX* col_walk = lastcols;
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* u_node = &unified_nodes[n];
+
+        u_node->id = h_node->id;
+        u_node->depth = h_node->depth;
+        u_node->num_in = h_node->num_in;
+        u_node->num_out = h_node->num_out;
+
+        u_node->dp_matrix = NULL;
+        u_node->last_col = col_walk;
+
+        col_walk += (seqSize + 1);
+
+        u_node->sequence.size = h_node->sequence.size;
+        cudaStatus = cudaMallocManaged((void**)&u_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET), cudaMemAttachGlobal);
+        if (cudaStatus != cudaSuccess) { fprintf(stderr, "sequence allocation failed!\n"); return -2; }
+
+        memcpy(u_node->sequence.sequence, h_node->sequence.sequence, h_node->sequence.size * sizeof(DTYPEALPHABET));
+
+        if (h_node->num_in > 0) {
+            cudaStatus = cudaMallocManaged((void**)&u_node->v_in, h_node->num_in * sizeof(Node*), cudaMemAttachGlobal);
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            u_node->v_in = NULL;
+        }
+
+        if (h_node->num_out > 0) {
+            cudaStatus = cudaMallocManaged((void**)&u_node->v_out, h_node->num_out * sizeof(Node*), cudaMemAttachGlobal);
+            if (cudaStatus != cudaSuccess) { return -2; }
+        } else {
+            u_node->v_out = NULL;
+        }
+    }
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        Node* h_node = &graph->nodes[n];
+        Node* u_node = &unified_nodes[n];
+
+        for (int i = 0; i < h_node->num_in; i++)
+            u_node->v_in[i] = &unified_nodes[h_node->v_in[i]->id];
+
+        for (int i = 0; i < h_node->num_out; i++)
+            u_node->v_out[i] = &unified_nodes[h_node->v_out[i]->id];
+    }
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        free(graph->nodes[n].sequence.sequence);
+        free(graph->nodes[n].v_in);
+        free(graph->nodes[n].v_out);
+    }
+    free(graph->nodes);
+
+    graph->nodes = unified_nodes;
+
+    cudaGraph->nodes = unified_nodes;
+    cudaGraph->num_nodes = graph->num_nodes;
+    cudaGraph->max_score = graph->max_score;
+    cudaGraph->max_score_node_id = graph->max_score_node_id;
+
+    return 0;
+}
+
+int free_unified_graph_last_col(Graph* graph, Graph* cudaGraph)
+{
+    if (graph->num_nodes > 0) cudaFree(graph->nodes[0].last_col);
+
+    for (int n = 0; n < graph->num_nodes; n++) {
+        cudaFree(graph->nodes[n].sequence.sequence);
+        cudaFree(graph->nodes[n].v_in);
+        cudaFree(graph->nodes[n].v_out);
+    }
+
+    cudaFree(graph->nodes);
+
+    graph->nodes = NULL;
+    graph->num_nodes = 0;
+    cudaGraph->nodes = NULL;
+    cudaGraph->num_nodes = 0;
+
+    return 0;
+}
+
+int init_advised_graph_last_col(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    int status = init_unified_graph_last_col(graph, cudaGraph, seqSize);
+    if (status != 0) return status;
+
+    size_t total_cols = (size_t)graph->num_nodes * (seqSize + 1);
+
+    keep_in_system_memory(graph->nodes[0].last_col, total_cols * sizeof(DTYPEMATRIX));
+    keep_in_system_memory(graph->nodes, graph->num_nodes * sizeof(Node));
+
+    return 0;
+}
+
+int free_advised_graph_last_col(Graph* graph, Graph* cudaGraph)
+{
+    return free_unified_graph_last_col(graph, cudaGraph);
+}
+
 // One shared graph for the GPU only versions of mode 3. Which allocator is behind it is chosen at
 // run time, because the answer is a property of the machine and not of the algorithm:
 //
@@ -955,6 +1085,30 @@ int free_shared_graph(Graph* graph, Graph* cudaGraph)
     if (strcmp(kind, "pinned") == 0) return free_pinned_graph(graph, cudaGraph);
 
     return free_unified_graph(graph, cudaGraph);
+}
+
+// The same choice of allocator, for the versions of mode 3 that keep only a last column per node.
+int init_shared_graph_last_col(Graph* graph, Graph* cudaGraph, int seqSize)
+{
+    const char* kind = getenv("SHARED_MEM_KIND");
+    if (kind == NULL) kind = "advised";
+
+    fprintf(stdout, "Shared last column graph allocated with SHARED_MEM_KIND=%s\n", kind);
+
+    if (strcmp(kind, "pinned") == 0)  return init_pinned_graph_last_col(graph, cudaGraph, seqSize);
+    if (strcmp(kind, "managed") == 0) return init_unified_graph_last_col(graph, cudaGraph, seqSize);
+
+    return init_advised_graph_last_col(graph, cudaGraph, seqSize);
+}
+
+int free_shared_graph_last_col(Graph* graph, Graph* cudaGraph)
+{
+    const char* kind = getenv("SHARED_MEM_KIND");
+    if (kind == NULL) kind = "advised";
+
+    if (strcmp(kind, "pinned") == 0) return free_pinned_graph_last_col(graph, cudaGraph);
+
+    return free_unified_graph_last_col(graph, cudaGraph);
 }
 
 #ifdef __cplusplus
