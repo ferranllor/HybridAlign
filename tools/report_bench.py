@@ -386,7 +386,8 @@ def part_levels(machine, dataset, mode, version, label, outdir, timeout):
     return rows
 
 
-def part_hga(machine, datasets, sizes, hga_bin, outdir, timeout):
+def part_hga(machine, datasets, sizes, solo_sizes, hga_bin, grid, block, outdir,
+             timeout):
     """Three engines on the same graph and the same reads: HGA, our mode 4, our CPU mode 0 v5.
 
     Only the real graph. HGA stores each in-edge as an 8-bit distance from the vertex that reads
@@ -398,7 +399,15 @@ def part_hga(machine, datasets, sizes, hga_bin, outdir, timeout):
     The common unit is GCUPS, which is what their paper reports and what
     "num_v * read_len * num_reads / seconds" comes to on both sides. It is the same quantity as our
     Gcell/s: HGA's num_v counts one vertex per base, and ours counts the same bases as node
-    sequence, so a cell there is a cell here."""
+    sequence, so a cell there is a cell here.
+
+    solo_sizes are batches run for HGA alone. HGA gives one read to one thread and loops
+    "read_id += grid * block", so it does not fill the GPU until the batch reaches grid * block
+    reads -- 8704 at the suggested 68 x 128 -- and its DP buffers are sized by that thread count
+    rather than by the batch, so a huge batch costs it no extra memory. Ours keeps a last column
+    per (node, read), so the same batch would be tens of GB and simply will not fit. Running the
+    big batches for HGA only is therefore what gives HGA its best case, and the honest way to
+    quote it: their peak, against ours at a batch that fits."""
     rows = []
 
     if not os.path.exists(hga_bin):
@@ -436,29 +445,36 @@ def part_hga(machine, datasets, sizes, hga_bin, outdir, timeout):
         def gcups(reads, seconds):
             return num_v * m * reads / seconds / 1e9 if seconds > 0 else float("nan")
 
-        print(f"    {num_v} vertices, {m} bp reads")
+        print(f"    {num_v} vertices, {m} bp reads, HGA at {grid} x {block} "
+              f"= {grid * block} threads")
         print(f"    {'reads':>7}{'HGA':>12}{'gpu_multi':>12}{'cpu_multi':>12}   (GCUPS)")
+
+        def run_hga(reads):
+            """-> (seconds, gcups) or None."""
+            if not hga_bin:
+                return None
+            rpath = os.path.join(workdir, f"{dataset}.r{reads}.hga.reads")
+            if not os.path.exists(rpath):
+                hga_convert.write_reads(rpath, query, reads)
+            # Match our scoring: +1 match, -1 mismatch, -1 gap. HGA negates mis and gap itself.
+            cmd = [hga_bin, "-g", gpath, "-r", rpath, "-m", "1", "-n", "1", "-o", "1",
+                   "-b", str(grid), "-t", str(block), "-d", "1"]
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except (subprocess.SubprocessError, OSError):
+                return None
+            hit = re.search(r"Time:\s*([0-9.eE+-]+)s,\s*GCUPS:\s*([0-9.eE+-]+)", out.stdout)
+            return (float(hit.group(1)), float(hit.group(2))) if hit else None
 
         for reads in sizes:
             line = {"machine": machine, "dataset": dataset, "read_len": m, "num_reads": reads}
             shown = {}
 
-            if hga_bin:
-                rpath = os.path.join(workdir, f"{dataset}.r{reads}.hga.reads")
-                if not os.path.exists(rpath):
-                    hga_convert.write_reads(rpath, query, reads)
-                # Match our scoring: +1 match, -1 mismatch, -1 gap. HGA negates mis and gap itself.
-                cmd = [hga_bin, "-g", gpath, "-r", rpath, "-m", "1", "-n", "1", "-o", "1",
-                       "-b", "68", "-t", "128", "-d", "1"]
-                try:
-                    out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-                    hit = re.search(r"Time:\s*([0-9.eE+-]+)s,\s*GCUPS:\s*([0-9.eE+-]+)", out.stdout)
-                except (subprocess.SubprocessError, OSError):
-                    hit = None
-                if hit:
-                    rows.append(dict(line, engine="hga", time_s=float(hit.group(1)),
-                                     gcups=float(hit.group(2))))
-                    shown["hga"] = float(hit.group(2))
+            got = run_hga(reads)
+            if got:
+                rows.append(dict(line, engine="hga", time_s=got[0], gcups=got[1],
+                                 hga_threads=grid * block))
+                shown["hga"] = got[1]
 
             # Ours: mode 4 is the GPU batch, mode 0 version 5 is the same batch on the CPU.
             for engine, mode, version in (("gpu_multi", 4, 0), ("cpu_multi", 0, 5)):
@@ -473,6 +489,18 @@ def part_hga(machine, datasets, sizes, hga_bin, outdir, timeout):
                 return f"{shown[k]:.2f}" if k in shown else "-"
 
             print(f"    {reads:>7}{col('hga'):>12}{col('gpu_multi'):>12}{col('cpu_multi'):>12}")
+
+        # HGA alone, out where it finally has a read per thread and ours would not fit.
+        solo = sorted(r for r in set(solo_sizes) | {grid * block} if r > max(sizes, default=0))
+        for reads in solo:
+            got = run_hga(reads)
+            if not got:
+                continue
+            rows.append({"machine": machine, "dataset": dataset, "read_len": m,
+                         "num_reads": reads, "engine": "hga", "time_s": got[0],
+                         "gcups": got[1], "hga_threads": grid * block})
+            note = "  <- one read per thread" if reads >= grid * block else ""
+            print(f"    {reads:>7}{got[1]:>12.2f}{'-':>12}{'-':>12}{note}")
 
     return rows
 
@@ -516,6 +544,14 @@ def main():
                          "distance cannot represent 150_10 (see part_hga)")
     ap.add_argument("--hga-sizes", nargs="+", type=int, default=[1, 16, 64, 256, 1024],
                     help="reads per batch for the three-way comparison")
+    ap.add_argument("--hga-solo-sizes", nargs="+", type=int, default=[4096, 8704, 17408],
+                    help="batches run for HGA alone, past where ours fits in VRAM. HGA needs "
+                         "grid*block reads before every thread has one, so this is where it "
+                         "reaches its peak; grid*block is always added")
+    ap.add_argument("--hga-grid", type=int, default=68,
+                    help="HGA thread blocks (default 68, the value its README suggests and the "
+                         "one the existing measurements used)")
+    ap.add_argument("--hga-block", type=int, default=128, help="HGA threads per block")
     ap.add_argument("--hga-bin", default=os.path.join("outputs", "hga", "hga-src", "bin", "hga"),
                     help="HGA binary; build it with tools/hga_setup.sh")
     ap.add_argument("--levels-of", nargs="+",
@@ -580,11 +616,13 @@ def main():
                   ["machine", "dataset", "version", "num_reads", "time_s", "per_read_ms"])
 
     if "hga" not in args.skip:
-        hga_rows = part_hga(machine, args.hga_datasets, args.hga_sizes, args.hga_bin,
-                            args.outdir, args.timeout)
+        hga_rows = part_hga(machine, args.hga_datasets, args.hga_sizes, args.hga_solo_sizes,
+                            args.hga_bin, args.hga_grid, args.hga_block, args.outdir,
+                            args.timeout)
         print()
         write_csv(os.path.join(args.outdir, f"{machine}_hga.csv"), hga_rows,
-                  ["machine", "dataset", "engine", "read_len", "num_reads", "time_s", "gcups"])
+                  ["machine", "dataset", "engine", "read_len", "num_reads", "time_s", "gcups",
+                   "hga_threads"])
 
     if "levels" not in args.skip:
         # Only the first dataset: the per level story is about one graph's shape, and profiling

@@ -641,6 +641,16 @@ def fig_hga(data, outdir, dataset, width=COL_W):
             ax.plot([p[0] for p in pts], [p[1] for p in pts], marker=marker, ls=ls, ms=3.0,
                     lw=1.2, color=color, label=label, zorder=3)
 
+        # HGA hands one read to one thread, so it has nothing to saturate with until the batch
+        # reaches its launch width. Marking that explains the whole shape of its curve.
+        threads = {int(r["hga_threads"]) for r in rows
+                   if r["engine"] == "hga" and r.get("hga_threads")}
+        if threads:
+            t = max(threads)
+            ax.axvline(t, color=INK, lw=0.8, ls=(0, (2, 2)), zorder=2)
+            ax.text(t * 0.85, 0.04, "HGA: 1 read/thread ", transform=ax.get_xaxis_transform(),
+                    rotation=90, va="bottom", ha="right", fontsize=5.6, color=INK)
+
         ax.set_xscale("log", base=2)
         ax.set_yscale("log")
         ax.set_xlabel("reads per batch")
@@ -822,6 +832,21 @@ def write_numbers(data, levels_csv, outdir, dataset):
                 if "hga" in by_engine and "gpu_multi" in by_engine:
                     define(f"{mt}VsHga",
                            f"{by_engine['gpu_multi'][at] / max(by_engine['hga'][at], 1e-9):.0f}")
+
+            # HGA's own best case, from the batches it was given on its own: one read per thread.
+            if "hga" in by_engine:
+                peak_at = max(by_engine["hga"], key=lambda r: by_engine["hga"][r])
+                define(f"{mt}HgaPeakGcups", f"{by_engine['hga'][peak_at]:.1f}")
+                define(f"{mt}HgaPeakBatch", f"{peak_at:,}".replace(",", "\\,"))
+                if "gpu_multi" in by_engine and common:
+                    best_ours = max(by_engine["gpu_multi"].values())
+                    ours_at = max(by_engine["gpu_multi"],
+                                  key=lambda r: by_engine["gpu_multi"][r])
+                    define(f"{mt}OursPeakGcups", f"{best_ours:.1f}")
+                    define(f"{mt}OursPeakBatch", f"{ours_at:,}".replace(",", "\\,"))
+                    define(f"{mt}VsHgaPeak",
+                           f"{best_ours / max(by_engine['hga'][peak_at], 1e-9):.1f}")
+                    define(f"{mt}HgaBatchRatio", f"{peak_at // max(ours_at, 1)}")
 
         # batch saturation
         batch = [r for r in d.get("batch", []) if r["dataset"] == dataset]
