@@ -5,7 +5,7 @@ tools/report_bench.py left in the input directory.
 
     python3 tools/report_graph_stats.py                # once, machine independent
     python3 tools/report_bench.py -m spark             # on the DGX Spark
-    python3 tools/report_bench.py -m a100              # on the discrete box
+    python3 tools/report_bench.py -m a30               # on the discrete box
     python3 tools/report_figs.py                       # -> report/fig_*.pdf, report/numbers.tex
 
 Whatever machines it finds, it draws. One machine gives one panel per figure, two give two, so the
@@ -114,7 +114,7 @@ def load_all(indir):
     for path in sorted(glob.glob(os.path.join(indir, "*_timings.csv"))):
         machine = os.path.basename(path)[: -len("_timings.csv")]
         data[machine]["timings"] = read_csv(path)
-        for part in ("phases", "batch", "levels"):
+        for part in ("phases", "batch", "levels", "hga"):
             data[machine][part] = read_csv(os.path.join(indir, f"{machine}_{part}.csv"))
 
         info_path = os.path.join(indir, f"{machine}_machine.json")
@@ -323,11 +323,11 @@ def fig_throughput(levels_csv, data, outdir, dataset, width=COL_W, cut=16):
 # The rungs of the GPU ladder, in the order they were written. Anything profiled that is not in
 # here is still drawn, at the end, so adding a kernel needs no edit.
 KERNEL_ORDER = ["gpu_shared_mem", "gpu_last_col", "gpu_warps", "gpu_registers",
-                "gpu_merged_req", "gpu_short2"]
+                "gpu_merged_req"]
 
 KERNEL_SHORT = {"gpu_shared_mem": "shared_mem", "gpu_last_col": "last_col",
                 "gpu_warps": "warps", "gpu_registers": "registers",
-                "gpu_merged_req": "merged_req", "gpu_short2": "short2"}
+                "gpu_merged_req": "merged_req"}
 
 
 def fig_kernels(levels_csv, data, outdir, dataset, cut=16):
@@ -604,6 +604,58 @@ def fig_anatomy(data, outdir, dataset):
 
 
 # -------------------------------------------------------------------------------------------------
+#                        Figure: against the state of the art
+# -------------------------------------------------------------------------------------------------
+
+ENGINE_STYLE = {
+    "hga":       ("HGA (ICPP'21)", INK2,                 "s", (0, (3, 2))),
+    "gpu_multi": ("ours, GPU batch", GROUP_COLOR["hybrid"], "o", "-"),
+    "cpu_multi": ("ours, CPU batch", GROUP_COLOR["cpu"],    "^", "-"),
+}
+
+
+def fig_hga(data, outdir, dataset, width=COL_W):
+    """Throughput against batch size for the three engines, on the real graph.
+
+    GCUPS is the unit HGA's paper reports and is the same quantity as our Gcell/s, because their
+    one-vertex-per-base graph holds exactly the bases our nodes hold. Batch size is the x axis
+    because that is the only axis any of the three can scale on: a real pangenome graph is a thin
+    chain, so there is no node parallelism to exploit within one read."""
+    machines = [m for m in sorted(data)
+                if any(r["dataset"] == dataset for r in data[m].get("hga", []))]
+    if not machines:
+        print(f"  no hga rows for {dataset}, skipping fig_hga", file=sys.stderr)
+        return
+
+    n = len(machines)
+    fig, axes = plt.subplots(1, n, figsize=(TEXT_W if n > 1 else width, width * 0.62),
+                             squeeze=False, sharey=True)
+
+    for ax, machine in zip(axes[0], machines):
+        rows = [r for r in data[machine]["hga"] if r["dataset"] == dataset]
+        for engine, (label, color, marker, ls) in ENGINE_STYLE.items():
+            pts = sorted((int(r["num_reads"]), float(r["gcups"]))
+                         for r in rows if r["engine"] == engine)
+            if not pts:
+                continue
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], marker=marker, ls=ls, ms=3.0,
+                    lw=1.2, color=color, label=label, zorder=3)
+
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_xlabel("reads per batch")
+        ax.set_title(machine_title(machine, data[machine].get("info")), loc="left", color=INK)
+        clean_ax(ax, xgrid=False, ygrid=True)
+
+    axes[0][0].set_ylabel("GCUPS")
+    axes[0][0].legend(frameon=False, loc="upper left", labelcolor=INK2, handlelength=1.6,
+                      borderpad=0.1, labelspacing=0.25)
+
+    fig.tight_layout(pad=0.3)
+    save(fig, outdir, "fig_hga")
+
+
+# -------------------------------------------------------------------------------------------------
 #                        numbers.tex
 # -------------------------------------------------------------------------------------------------
 
@@ -619,7 +671,7 @@ DATASET_TAG = {"150_10": "Syn", "150_10_small": "SynSmall", "500_10": "SynLong",
                "brca2_150": "Brca", "brca2_400": "BrcaFour", "brca2_1500": "BrcaLong",
                "brca2_4500": "BrcaXL"}
 
-MACHINE_TAG = {"spark": "Spark", "a100": "Ampere", "h100": "Hopper",
+MACHINE_TAG = {"spark": "Spark", "a30": "Ampere", "a100": "AHundred", "h100": "Hopper",
                "rtx5060ti": "Blackwell", "rtx4090": "Ada"}
 
 
@@ -753,6 +805,24 @@ def write_numbers(data, levels_csv, outdir, dataset):
             define(f"{mt}WideGain{short}", f"{gcs / ref:.2f}")
             define(f"{mt}Thin{short}", f"{a[2] * 1e3:.0f}")
 
+        # state of the art comparison, at the largest batch every engine reached
+        hrows = [r for r in d.get("hga", []) if r["dataset"] == "brca2_150"]
+        if hrows:
+            by_engine = defaultdict(dict)
+            for r in hrows:
+                by_engine[r["engine"]][int(r["num_reads"])] = float(r["gcups"])
+            common = set.intersection(*(set(v) for v in by_engine.values())) if by_engine else set()
+            if common:
+                at = max(common)
+                define(f"{mt}HgaBatch", str(at))
+                for engine, short in (("hga", "Hga"), ("gpu_multi", "GpuBatch"),
+                                      ("cpu_multi", "CpuBatch")):
+                    if engine in by_engine:
+                        define(f"{mt}{short}Gcups", f"{by_engine[engine][at]:.1f}")
+                if "hga" in by_engine and "gpu_multi" in by_engine:
+                    define(f"{mt}VsHga",
+                           f"{by_engine['gpu_multi'][at] / max(by_engine['hga'][at], 1e-9):.0f}")
+
         # batch saturation
         batch = [r for r in d.get("batch", []) if r["dataset"] == dataset]
         if batch:
@@ -796,6 +866,8 @@ def main():
                     help="dataset the runtime and anatomy figures are about (default: 150_10)")
     ap.add_argument("--structure-datasets", nargs="+", default=["150_10", "brca2_150"],
                     help="the graphs the structure figure draws (default: one synthetic, one real)")
+    ap.add_argument("--hga-dataset", default="brca2_150",
+                    help="real graph the state-of-the-art comparison figure is about")
     ap.add_argument("--col-width", type=float, default=COL_W,
                     help=f"\\columnwidth in inches (default {COL_W}, measured from the report's "
                          "own geometry). Match this and includegraphics never rescales.")
@@ -816,6 +888,7 @@ def main():
     fig_kernels(levels_csv, data, args.outdir, args.dataset)
     fig_runtime(data, args.outdir, args.dataset)
     fig_anatomy(data, args.outdir, args.dataset)
+    fig_hga(data, args.outdir, args.hga_dataset)
     write_numbers(data, levels_csv, args.outdir, args.dataset)
 
 
