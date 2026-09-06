@@ -24,7 +24,7 @@
 #include "include/cuda_last_col.cuh"
 #include "include/cuda_warps.cuh"
 #include "include/cuda_registers.cuh"
-#include "include/cuda_registers_short2.cuh"
+//#include "include/cuda_registers_short2.cuh"
 #include "include/cuda_registers_merged_req.cuh"
 #include "include/cuda_multi.cuh"
 #include "include/cuda_multi_registers.cuh"
@@ -668,7 +668,7 @@ int main(int argc, char *argv[]) {
             case 10: res = gpu_align_registers(graph, cudaGraph, sequence); break;
             case 11: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
             case 12: res = gpu_align_registers_merged_req(graph, cudaGraph, sequence); break;
-            case 13: res = gpu_align_registers_short2(graph, cudaGraph, sequence); break;
+            //case 13: res = gpu_align_registers_short2(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
     }
@@ -753,7 +753,7 @@ int main(int argc, char *argv[]) {
                 case 10: res = gpu_align_registers(graph, cudaGraph, sequence); break;
                 case 11: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
                 case 12: res = gpu_align_registers_merged_req(graph, cudaGraph, sequence); break;
-                case 13: res = gpu_align_registers_short2(graph, cudaGraph, sequence); break;
+                //case 13: res = gpu_align_registers_short2(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }

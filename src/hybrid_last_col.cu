@@ -2,7 +2,7 @@
 #include "../include/cuda_warps.cuh"
 #include "../include/cuda_registers.cuh"
 #include "../include/cuda_registers_merged_req.cuh"
-#include "../include/cuda_registers_short2.cuh"
+//#include "../include/cuda_registers_short2.cuh"
 #include "../include/nvtx_ranges.cuh"
 
 extern "C" {
@@ -123,7 +123,7 @@ static AlignmentResult gpu_align_hybrid_last_col(Graph graph, Graph cudaGraph, S
 
                 compute_dp_gpu_registers_merged_req<<<gridDim, blockDim, shared_bytes, compute_stream>>>(
                     act, nodes_per_level[d], sequence, sequence_rev, elems_per_warp, toprow_slots);
-            } else if (kernel_kind == HYBRID_SHORT2) {
+            } /*else if (kernel_kind == HYBRID_SHORT2) {
                 int toprow_slots = registers_short2_toprow_slots(max_node_size, sequence.size);
                 int elems_per_warp = registers_short2_elems_per_warp(max_node_size, sequence.size);
                 int shared_bytes = WARPS_PER_BLOCK * elems_per_warp * sizeof(DTYPEMATRIX);
@@ -131,7 +131,7 @@ static AlignmentResult gpu_align_hybrid_last_col(Graph graph, Graph cudaGraph, S
 
                 compute_dp_gpu_registers_short2<<<gridDim, blockDim, shared_bytes, compute_stream>>>(
                     act, nodes_per_level[d], sequence, sequence_rev, elems_per_warp, toprow_slots);
-            } else {
+            } */else {
                 int band_width = band_width_for_level(max_node_size, sequence.size);
                 int toprow_slots = warps_toprow_slots(max_node_size, sequence.size);
                 int elems_per_warp = warps_elems_per_warp(max_node_size, sequence.size, band_width);
