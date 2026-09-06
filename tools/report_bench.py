@@ -35,38 +35,51 @@ import shutil
 import subprocess
 import sys
 
-# The narrative order of the report: CPU first, then GPU, then the last column CPU baseline that
-# makes the GPU comparison fair, then the hybrid. Kept as a list of (mode, version, label, group)
-# so both the CSV and the figures inherit the same ordering and never re-sort by value.
+# The narrative order of the report, which is split in two. "matrix" versions keep a full DP
+# matrix per node and are compared on wall time; "lastcol" versions keep only a node's last column,
+# which makes their wall time say more about the CPU tail than about the kernel, so they are
+# compared on achieved throughput instead. Each row is (mode, version, label, group, part), and
+# both the CSVs and the figures inherit this ordering rather than re-sorting by value.
 PLAN = [
-    (0, 0,  "cpu_sequential",     "cpu"),
-    (0, 1,  "cpu_simd",           "cpu"),
-    (0, 3,  "cpu_parallel_node",  "cpu"),
-    (1, 0,  "gpu_naive",          "gpu"),
-    (1, 5,  "gpu_async_batching", "gpu"),
-    (1, 7,  "gpu_shared_mem",     "gpu"),
-    (1, 8,  "gpu_last_col",       "gpu"),
-    (1, 9,  "gpu_warps",          "gpu"),
-    (1, 10, "gpu_registers",      "gpu"),
-    (0, 4,  "cpu_last_col",       "fair"),
-    (2, 4,  "hybrid_warps",       "hybrid"),
-    (2, 5,  "hybrid_registers",   "hybrid"),
+    # ---- keeps the full DP matrix: compared on wall time ----------------------------------------
+    (0, 0,  "cpu_sequential",       "cpu",    "matrix"),
+    (0, 1,  "cpu_simd",             "cpu",    "matrix"),
+    (0, 3,  "cpu_parallel_node",    "cpu",    "matrix"),
+    (1, 0,  "gpu_naive",            "gpu",    "matrix"),
+    (1, 2,  "gpu_parallel_node",    "gpu",    "matrix"),
+    (1, 3,  "gpu_parallel_async",   "gpu",    "matrix"),
+    (1, 4,  "gpu_async_monolithic", "gpu",    "matrix"),
+    (1, 5,  "gpu_async_batching",   "gpu",    "matrix"),
+    (1, 7,  "gpu_shared_mem",       "gpu",    "matrix"),
+    (2, 0,  "hybrid_base",          "hybrid", "matrix"),
+    (2, 1,  "hybrid_unified",       "hybrid", "matrix"),
+    (2, 2,  "hybrid_pinned",        "hybrid", "matrix"),
+    (2, 3,  "hybrid_advised",       "hybrid", "matrix"),
+
+    # ---- keeps only the last column: compared on dense level throughput -------------------------
+    (0, 4,  "cpu_last_col",         "fair",   "lastcol"),
+    (1, 8,  "gpu_last_col",         "gpu",    "lastcol"),
+    (1, 9,  "gpu_warps",            "gpu",    "lastcol"),
+    (1, 10, "gpu_registers",        "gpu",    "lastcol"),
+    (1, 12, "gpu_merged_req",       "gpu",    "lastcol"),
+    (2, 4,  "hybrid_warps",         "hybrid", "lastcol"),
+    (2, 5,  "hybrid_registers",     "hybrid", "lastcol"),
+    (2, 6,  "hybrid_merged_req",    "hybrid", "lastcol"),
 ]
 
-# Versions past the two that the report actually argues about. Off by default: they are a fair bit
-# of extra runtime and the report only mentions them if there is room left for the paragraph.
-EXTRA_PLAN = [
-    (1, 12, "gpu_merged_req",     "gpu"),
-    (2, 6,  "hybrid_merged_req",  "hybrid"),
-]
+# Nothing here at the moment: short2 is disabled in main.c and persistent kernels is excluded.
+EXTRA_PLAN = []
 
-# Mode 3 is the same GPU kernels on a graph both processors address directly, which only means
+# Mode 3 is the same kernels on a graph both processors address directly, which only means
 # anything where the memory is physically shared. Worth having on the Spark, pointless on a
-# discrete card, so it is opt in.
+# discrete card, so it is opt in. It spans both parts too.
 NOCOPY_PLAN = [
-    (3, 7,  "nocopy_last_col",    "nocopy"),
-    (3, 8,  "nocopy_warps",       "nocopy"),
-    (3, 9,  "nocopy_registers",   "nocopy"),
+    (3, 0,  "nocopy_naive",         "nocopy", "matrix"),
+    (3, 2,  "nocopy_level",         "nocopy", "matrix"),
+    (3, 6,  "nocopy_shared_mem",    "nocopy", "matrix"),
+    (3, 7,  "nocopy_last_col",      "nocopy", "lastcol"),
+    (3, 8,  "nocopy_warps",         "nocopy", "lastcol"),
+    (3, 9,  "nocopy_registers",     "nocopy", "lastcol"),
 ]
 
 DEFAULT_DATASETS = ["150_10", "brca2_150", "brca2_1500"]
@@ -178,7 +191,7 @@ def part_timings(machine, datasets, plan, timeout):
 
     for dataset in datasets:
         print(f"\n  == {dataset} ==")
-        for mode, version, label, group in plan:
+        for mode, version, label, group, part in plan:
             print(f"    {label:<20} (mode {mode} v{version}) ", end="", flush=True)
             res = run_one(dataset, mode, version, timeout)
             if res is None:
@@ -187,7 +200,7 @@ def part_timings(machine, datasets, plan, timeout):
             for it, t in res["iters"]:
                 timing_rows.append({"machine": machine, "dataset": dataset, "mode": mode,
                                     "version": version, "label": label, "group": group,
-                                    "iter": it, "time_s": t,
+                                    "part": part, "iter": it, "time_s": t,
                                     "align_len": res["align_len"], "identity": res["identity"]})
 
             timed = [t for i, t in res["iters"] if i >= 0]
@@ -594,7 +607,7 @@ def main():
         timing_rows, phase_rows = part_timings(machine, datasets, plan, args.timeout)
         print()
         write_csv(os.path.join(args.outdir, f"{machine}_timings.csv"), timing_rows,
-                  ["machine", "dataset", "mode", "version", "label", "group", "iter",
+                  ["machine", "dataset", "mode", "version", "label", "group", "part", "iter",
                    "time_s", "align_len", "identity"])
         if "phases" not in args.skip:
             write_csv(os.path.join(args.outdir, f"{machine}_phases.csv"), phase_rows,
@@ -628,7 +641,7 @@ def main():
         # Only the first dataset: the per level story is about one graph's shape, and profiling
         # every version on every dataset would multiply the runtime for nothing.
         ds = args.datasets[0] if args.datasets else "150_10"
-        known = {(m, v): lab for m, v, lab, _ in PLAN + EXTRA_PLAN + NOCOPY_PLAN}
+        known = {(m, v): lab for m, v, lab, _, _ in PLAN + EXTRA_PLAN + NOCOPY_PLAN}
 
         level_rows = []
         for spec in args.levels_of:
