@@ -1,6 +1,8 @@
 #include "../include/hybrid_last_col.cuh"
 #include "../include/cuda_warps.cuh"
 #include "../include/cuda_registers.cuh"
+#include "../include/cuda_registers_merged_req.cuh"
+#include "../include/cuda_registers_short2.cuh"
 #include "../include/nvtx_ranges.cuh"
 
 extern "C" {
@@ -25,8 +27,22 @@ static inline double hybrid_last_col_now_ms(void)
 // I guess this one was only logical. Now that we don't have to move almost any data, having a hybrid version always works,
 // given the lack of paralelism of the long tail in the datasets
 
+// Which core runs on the dense levels. The CPU tail is the same in every case, so this only picks
+// the kernel the wide levels are handed to.
+enum HybridKernel { HYBRID_WARPS = 0, HYBRID_REGISTERS, HYBRID_MERGED_REQ, HYBRID_SHORT2 };
+
+static const char* hybrid_kernel_name(int k)
+{
+    switch (k) {
+        case HYBRID_REGISTERS:  return "registers";
+        case HYBRID_MERGED_REQ: return "merged_req";
+        case HYBRID_SHORT2:     return "short2";
+        default:                return "warps";
+    }
+}
+
 static AlignmentResult gpu_align_hybrid_last_col(Graph graph, Graph cudaGraph, Sequence sequence,
-                                                 bool use_registers)
+                                                 int kernel_kind)
 {
     bool stats = (getenv("HYBRID_STATS") != NULL);
     double t_launch = 0.0, t_sync = 0.0, t_cpu = 0.0, t_traceback = 0.0;
@@ -91,20 +107,36 @@ static AlignmentResult gpu_align_hybrid_last_col(Graph graph, Graph cudaGraph, S
             dim3 blockDim(WARPS_PER_BLOCK * 32);
             dim3 gridDim((nodes_per_level[d] + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
 
-            if (use_registers) {
+            if (kernel_kind == HYBRID_REGISTERS) {
                 int toprow_slots = registers_toprow_slots(max_node_size, sequence.size);
                 int elems_per_warp = registers_elems_per_warp(max_node_size, sequence.size);
                 int shared_bytes = WARPS_PER_BLOCK * elems_per_warp * sizeof(DTYPEMATRIX);
-                check_shared_fits(use_registers ? "hybrid registers" : "hybrid warps", d, shared_bytes);
+                check_shared_fits(hybrid_kernel_name(kernel_kind), d, shared_bytes);
 
                 compute_dp_gpu_registers<<<gridDim, blockDim, shared_bytes, compute_stream>>>(
+                    act, nodes_per_level[d], sequence, sequence_rev, elems_per_warp, toprow_slots);
+            } else if (kernel_kind == HYBRID_MERGED_REQ) {
+                int toprow_slots = registers_merged_req_toprow_slots(max_node_size, sequence.size);
+                int elems_per_warp = registers_merged_req_elems_per_warp(max_node_size, sequence.size);
+                int shared_bytes = WARPS_PER_BLOCK * elems_per_warp * sizeof(DTYPEMATRIX);
+                check_shared_fits(hybrid_kernel_name(kernel_kind), d, shared_bytes);
+
+                compute_dp_gpu_registers_merged_req<<<gridDim, blockDim, shared_bytes, compute_stream>>>(
+                    act, nodes_per_level[d], sequence, sequence_rev, elems_per_warp, toprow_slots);
+            } else if (kernel_kind == HYBRID_SHORT2) {
+                int toprow_slots = registers_short2_toprow_slots(max_node_size, sequence.size);
+                int elems_per_warp = registers_short2_elems_per_warp(max_node_size, sequence.size);
+                int shared_bytes = WARPS_PER_BLOCK * elems_per_warp * sizeof(DTYPEMATRIX);
+                check_shared_fits(hybrid_kernel_name(kernel_kind), d, shared_bytes);
+
+                compute_dp_gpu_registers_short2<<<gridDim, blockDim, shared_bytes, compute_stream>>>(
                     act, nodes_per_level[d], sequence, sequence_rev, elems_per_warp, toprow_slots);
             } else {
                 int band_width = band_width_for_level(max_node_size, sequence.size);
                 int toprow_slots = warps_toprow_slots(max_node_size, sequence.size);
                 int elems_per_warp = warps_elems_per_warp(max_node_size, sequence.size, band_width);
                 int shared_bytes = WARPS_PER_BLOCK * elems_per_warp * sizeof(DTYPEMATRIX);
-                check_shared_fits(use_registers ? "hybrid registers" : "hybrid warps", d, shared_bytes);
+                check_shared_fits(hybrid_kernel_name(kernel_kind), d, shared_bytes);
 
                 compute_dp_gpu_warps<<<gridDim, blockDim, shared_bytes, compute_stream>>>(
                     act, nodes_per_level[d], sequence, sequence_rev, elems_per_warp, toprow_slots, band_width);
@@ -245,7 +277,7 @@ static AlignmentResult gpu_align_hybrid_last_col(Graph graph, Graph cudaGraph, S
     if (stats) {
         fprintf(stderr, "[hybrid %s] total %7.2f ms | launch %6.2f ms (%d levels) | wait %7.2f ms (%d syncs) "
                         "| cpu %7.2f ms (%d levels) | traceback %5.2f ms\n",
-                use_registers ? "registers" : "warps",
+                hybrid_kernel_name(kernel_kind),
                 hybrid_last_col_now_ms() - t_total, t_launch, gpu_levels, t_sync, syncs,
                 t_cpu, cpu_levels, t_traceback);
     }
@@ -255,12 +287,22 @@ static AlignmentResult gpu_align_hybrid_last_col(Graph graph, Graph cudaGraph, S
 
 AlignmentResult gpu_align_hybrid_warps(Graph graph, Graph cudaGraph, Sequence sequence)
 {
-    return gpu_align_hybrid_last_col(graph, cudaGraph, sequence, false);
+    return gpu_align_hybrid_last_col(graph, cudaGraph, sequence, HYBRID_WARPS);
 }
 
 AlignmentResult gpu_align_hybrid_registers(Graph graph, Graph cudaGraph, Sequence sequence)
 {
-    return gpu_align_hybrid_last_col(graph, cudaGraph, sequence, true);
+    return gpu_align_hybrid_last_col(graph, cudaGraph, sequence, HYBRID_REGISTERS);
+}
+
+AlignmentResult gpu_align_hybrid_merged_req(Graph graph, Graph cudaGraph, Sequence sequence)
+{
+    return gpu_align_hybrid_last_col(graph, cudaGraph, sequence, HYBRID_MERGED_REQ);
+}
+
+AlignmentResult gpu_align_hybrid_short2(Graph graph, Graph cudaGraph, Sequence sequence)
+{
+    return gpu_align_hybrid_last_col(graph, cudaGraph, sequence, HYBRID_SHORT2);
 }
 
 // *************************************************************************************************

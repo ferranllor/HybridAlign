@@ -15,6 +15,8 @@ extern "C" {
 
 AlignmentResult gpu_align_hybrid_warps(Graph graph, Graph cudaGraph, Sequence sequence);
 AlignmentResult gpu_align_hybrid_registers(Graph graph, Graph cudaGraph, Sequence sequence);
+AlignmentResult gpu_align_hybrid_merged_req(Graph graph, Graph cudaGraph, Sequence sequence);
+AlignmentResult gpu_align_hybrid_short2(Graph graph, Graph cudaGraph, Sequence sequence);
 AlignmentResult compute_traceback_hybrid_last_col(Graph graph, Sequence sequence);
 
 #ifdef __cplusplus

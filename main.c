@@ -24,6 +24,8 @@
 #include "include/cuda_last_col.cuh"
 #include "include/cuda_warps.cuh"
 #include "include/cuda_registers.cuh"
+#include "include/cuda_registers_short2.cuh"
+#include "include/cuda_registers_merged_req.cuh"
 #include "include/cuda_multi.cuh"
 #include "include/cuda_multi_registers.cuh"
 #include "include/cuda_shared_mem.cuh"
@@ -468,6 +470,8 @@ static void print_usage(const char* program)
     fprintf(stderr, "   9 = warps (warp per node, shared mem)\n");
     fprintf(stderr, "  10 = registers (warp per node, shuffles)\n");
     fprintf(stderr, "  11 = persistent kernels (registers core, last column only)\n");
+    fprintf(stderr, "  12 = registers, halo loads and handover stores merged 32 diagonals at a time\n");
+    //fprintf(stderr, "  13 = registers, 12 plus two cells per lane packed in one register (DPX)\n"); Not working yet
 
     fprintf(stderr, " Mode 2 (hybrid CPU-GPU), 0-%d:\n", HYBRID_MAX_VERSION);
     fprintf(stderr, "   0 = base (explicit copies)\n");
@@ -476,6 +480,8 @@ static void print_usage(const char* program)
     fprintf(stderr, "   3 = advised (managed memory, migration hints)\n");
     fprintf(stderr, "   4 = warps on the dense levels, CPU on the tail (pinned last columns)\n");
     fprintf(stderr, "   5 = registers on the dense levels, CPU on the tail (pinned last columns)\n");
+    fprintf(stderr, "   6 = merged_req on the dense levels, CPU on the tail (pinned last columns)\n");
+    fprintf(stderr, "   7 = short2 on the dense levels, CPU on the tail (pinned last columns)\n");
 
     fprintf(stderr, " Mode 4 (multiple sequences), 0-%d:\n", MULTI_MAX_VERSION);
     fprintf(stderr, "   0 = warp per (node, read), set NUM_READS in the environment\n");
@@ -592,12 +598,14 @@ int main(int argc, char *argv[]) {
             case 9: init_cpu_graph_last_col(&graph, sequence.size); break;
             case 10: init_cpu_graph_last_col(&graph, sequence.size); break;
             case 11: init_cpu_graph_last_col(&graph, sequence.size); break;
+            case 12: init_cpu_graph_last_col(&graph, sequence.size); break;
+            case 13: init_cpu_graph_last_col(&graph, sequence.size); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
 
         // The last column versions keep a last column instead of full score matrices, so they lay
         // the device side out differently as well.
-        if   (version == 8 || version == 9 || version == 10 || version == 11) init_gpu_graph_last_col(&graph, &cudaGraph, sequence.size);
+        if   (version >= 8 && version <= 13) init_gpu_graph_last_col(&graph, &cudaGraph, sequence.size);
         else init_gpu_graph(&graph, &cudaGraph, sequence.size);
     }
     else if (Hybrid) {
@@ -608,6 +616,8 @@ int main(int argc, char *argv[]) {
             case 3: init_advised_graph(&graph, &cudaGraph, sequence.size); break;
             case 4: init_pinned_graph_last_col(&graph, &cudaGraph, sequence.size); break;
             case 5: init_pinned_graph_last_col(&graph, &cudaGraph, sequence.size); break;
+            case 6: init_pinned_graph_last_col(&graph, &cudaGraph, sequence.size); break;
+            case 7: init_pinned_graph_last_col(&graph, &cudaGraph, sequence.size); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }
@@ -657,6 +667,8 @@ int main(int argc, char *argv[]) {
             case 9: res = gpu_align_warps(graph, cudaGraph, sequence); break;
             case 10: res = gpu_align_registers(graph, cudaGraph, sequence); break;
             case 11: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
+            case 12: res = gpu_align_registers_merged_req(graph, cudaGraph, sequence); break;
+            case 13: res = gpu_align_registers_short2(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
     }
@@ -669,6 +681,8 @@ int main(int argc, char *argv[]) {
             case 3: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
             case 4: res = gpu_align_hybrid_warps(graph, cudaGraph, sequence); break;
             case 5: res = gpu_align_hybrid_registers(graph, cudaGraph, sequence); break;
+            case 6: res = gpu_align_hybrid_merged_req(graph, cudaGraph, sequence); break;
+            case 7: res = gpu_align_hybrid_short2(graph, cudaGraph, sequence); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }
@@ -738,6 +752,8 @@ int main(int argc, char *argv[]) {
                 case 9: res = gpu_align_warps(graph, cudaGraph, sequence); break;
                 case 10: res = gpu_align_registers(graph, cudaGraph, sequence); break;
                 case 11: res = gpu_align_persistent_kernels(graph, cudaGraph, sequence); break;
+                case 12: res = gpu_align_registers_merged_req(graph, cudaGraph, sequence); break;
+                case 13: res = gpu_align_registers_short2(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
             }
         }
@@ -750,6 +766,8 @@ int main(int argc, char *argv[]) {
                 case 3: res = gpu_align_hybrid_pinned(graph, cudaGraph, sequence); break;
                 case 4: res = gpu_align_hybrid_warps(graph, cudaGraph, sequence); break;
                 case 5: res = gpu_align_hybrid_registers(graph, cudaGraph, sequence); break;
+                case 6: res = gpu_align_hybrid_merged_req(graph, cudaGraph, sequence); break;
+                case 7: res = gpu_align_hybrid_short2(graph, cudaGraph, sequence); break;
                 default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
             }
         }
@@ -811,10 +829,12 @@ int main(int argc, char *argv[]) {
             case 9: free_cpu_graph_last_col(&graph); break;
             case 10: free_cpu_graph_last_col(&graph); break;
             case 11: free_cpu_graph_last_col(&graph); break;
+            case 12: free_cpu_graph_last_col(&graph); break;
+            case 13: free_cpu_graph_last_col(&graph); break;
             default: fprintf(stderr, "Unspecified GPU version!\n"); return -4;
         }
 
-        if   (version == 8 || version == 9 || version == 10 || version == 11) free_gpu_graph_last_col(&cudaGraph);
+        if   (version >= 8 && version <= 13) free_gpu_graph_last_col(&cudaGraph);
         else free_gpu_graph(&cudaGraph);
     }
     else if (Hybrid) {
@@ -825,6 +845,8 @@ int main(int argc, char *argv[]) {
             case 3: free_advised_graph(&graph, &cudaGraph); break;
             case 4: free_pinned_graph_last_col(&graph, &cudaGraph); break;
             case 5: free_pinned_graph_last_col(&graph, &cudaGraph); break;
+            case 6: free_pinned_graph_last_col(&graph, &cudaGraph); break;
+            case 7: free_pinned_graph_last_col(&graph, &cudaGraph); break;
             default: fprintf(stderr, "Unspecified Hybrid version!\n"); return -4;
         }
     }

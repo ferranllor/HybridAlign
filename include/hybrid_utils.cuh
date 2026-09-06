@@ -13,7 +13,7 @@
 // more than the whole level does on 2 CPU threads.
 // Overridable from the command line (-DHYBRID_MIN_NODES=...) so the sweeps can move it.
 #ifndef HYBRID_MIN_NODES
-#define HYBRID_MIN_NODES 8
+#define HYBRID_MIN_NODES 16
 #endif
 
 // Threads used for a CPU level. A level that goes to the CPU has fewer than HYBRID_MIN_NODES nodes

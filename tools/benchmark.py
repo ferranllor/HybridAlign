@@ -26,9 +26,11 @@ CPU_LABELS = {0: "sequential", 1: "simd", 2: "simd_parallel_dp", 3: "simd_parall
               4: "last_col", 5: "multi"}
 GPU_LABELS = {0: "naive", 1: "naive(pinned)", 2: "parallel_node", 3: "parallel_async",
               4: "async_monolithic", 5: "async_batching", 7: "shared_mem",
-              8: "last_col", 9: "warps", 10: "registers", 11: "persistent_kernels"}
+              8: "last_col", 9: "warps", 10: "registers", 11: "persistent_kernels",
+              12: "registers_merged_req", 13: "registers_short2"}
 HYBRID_LABELS = {0: "hybrid_base", 1: "hybrid_unified", 2: "hybrid_pinned",
-                 3: "hybrid_advised", 4: "hybrid_warps", 5: "hybrid_registers"}
+                 3: "hybrid_advised", 4: "hybrid_warps", 5: "hybrid_registers",
+                 6: "hybrid_merged_req", 7: "hybrid_short2"}
 NOCOPY_LABELS = {0: "nc_naive", 1: "nc_naive", 2: "nc_level", 3: "nc_level", 4: "nc_level",
                  5: "nc_level", 6: "nc_shared_mem", 7: "nc_last_col", 8: "nc_warps",
                  9: "nc_registers", 10: "nc_persistent_kernels"}

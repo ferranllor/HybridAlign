@@ -13,8 +13,8 @@
 // Highest valid version for each mode, used by main.c to validate the arguments and to print the
 // usage. Bump these when a new version is added to the switches in main.c.
 #define CPU_MAX_VERSION    5
-#define GPU_MAX_VERSION    11
-#define HYBRID_MAX_VERSION 5
+#define GPU_MAX_VERSION    12
+#define HYBRID_MAX_VERSION 7
 #define NOCOPY_MAX_VERSION 10
 #define MULTI_MAX_VERSION  1
 
