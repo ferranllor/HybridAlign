@@ -2,7 +2,6 @@ exec
 perf.data
 perf.data.old
 bin/*
-datasets/*
 obj/*
 utils/*.gam
 utils/*.fq
