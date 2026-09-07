@@ -94,9 +94,14 @@ DEFAULT_BATCH = [1, 4, 16, 64, 256, 1024]
 ITER_RE = re.compile(r"Iteration\s+(-?\d+)\s+took\s+([0-9.eE+-]+)s")
 LEN_RE = re.compile(r"Alignment Length:\s*(\d+)")
 IDENT_RE = re.compile(r"Identity Score:\s*([0-9.]+)%")
-# [hybrid registers] total 134.71 ms | launch 0.03 ms (13 levels) | wait 40.99 ms (1 syncs) | ...
+# Two spellings, because the last-column hybrids name the kernel they used and the matrix-era
+# ones do not:
+#   [hybrid registers] total 134.71 ms | launch 0.03 ms (13 levels) | wait 40.99 ms (1 syncs) | ...
+#   [hybrid] total 171.01 ms | launch 0.18 ms (16 levels) | wait 82.53 ms (3 syncs) | ...
+# Missing the second spelling is what hid the CPU/GPU split of the matrix hybrids, which is the
+# only thing that says whether a memory kind costs the CPU phase or the GPU phase.
 PHASE_RE = re.compile(
-    r"\[hybrid (\S+)\] total\s+([0-9.]+) ms \| launch\s+([0-9.]+) ms \((\d+) levels\) \| "
+    r"\[hybrid ?(\S*)\] total\s+([0-9.]+) ms \| launch\s+([0-9.]+) ms \((\d+) levels\) \| "
     r"wait\s+([0-9.]+) ms \((\d+) syncs\) \| cpu\s+([0-9.]+) ms \((\d+) levels\) \| "
     r"traceback\s+([0-9.]+) ms")
 

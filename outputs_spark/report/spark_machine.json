@@ -1,0 +1,9 @@
+{
+  "host": "disi-spark1.unitn.it",
+  "arch": "aarch64",
+  "gpu": "NVIDIA GB10",
+  "sms": 0,
+  "cpu": "aarch64",
+  "cores": 20,
+  "machine": "spark"
+}

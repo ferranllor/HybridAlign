@@ -9,14 +9,19 @@ utils/*.fq
 utils/*.tsv
 tests
 utils/gensequence.sh
-*.nsys-rep
 .vscode/*
 
-outputs/*
+outputs
 src/unused
 tools/bin/*
 tools/obj/*
 include/cuda_async_registers.cuh
 report-multi-shorts.ncu-rep
 utils/Seq-to-graph utils
-report*/
+tools/__pycache__/hga_convert.cpython-313.pyc
+.gitignore
+src/cuda_registers_short2.cu
+include/cuda_registers_short2.cuh
+.gitignore
+tools/__pycache__/report_bench.cpython-313.pyc
+include/cuda_dp_registers_short2.cuh

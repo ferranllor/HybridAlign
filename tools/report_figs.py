@@ -54,6 +54,10 @@ except ImportError:
 
 # Print palette: dark enough to survive a greyscale printout, and the four groups are also
 # separated by their position in the fixed ordering, never by colour alone.
+# Width at which a level is reported as "dense". This is a reporting bucket, not the
+# scheduler's threshold (that one is derived per machine as \HybridCut).
+DENSE_CUT = 8
+
 INK = "#111111"
 INK2 = "#5a5a5a"
 GRID = "#d8d8d4"
@@ -215,7 +219,7 @@ def fig_structure(levels_csv, outdir, show, width=COL_W):
     save(fig, outdir, "fig_structure")
 
 
-def fig_throughput(levels_csv, data, outdir, dataset, width=COL_W, cut=16):
+def fig_throughput(levels_csv, data, outdir, dataset, width=COL_W, cut=DENSE_CUT):
     """Achieved throughput against level width: what it costs to ignore the shape above.
 
     Kept as its own figure now that fig_structure is density only. One point per width bin, from a
@@ -324,15 +328,30 @@ KERNEL_SHORT = {"gpu_shared_mem": "shared_mem", "gpu_last_col": "last_col",
                 "gpu_merged_req": "merged_req"}
 
 
-def kernel_split(levels_csv, data, dataset, cut=16, top=3):
+def version_numbers(data):
+    """{label: "v9"} taken from the CSVs rather than hardcoded, so the figure cannot drift from
+    the version numbering the prose uses. The reader has not seen the code, so a bare
+    `merged_req` on an axis is not something they can match to a "v12" in the text."""
+    out = {}
+    for d in data.values():
+        for key in ("levels", "timings"):
+            for r in d.get(key, []):
+                lab, ver = r.get("label"), r.get("version")
+                if lab and ver is not None and str(ver).strip().isdigit():
+                    out.setdefault(lab, f"v{int(ver)}")
+    return out
+
+
+def kernel_split(levels_csv, data, dataset, cut=DENSE_CUT, top=3):
     """-> ({machine: {label: (top-N Gcell/s, dense Gcell/s, thin Gcell/s)}}, cells per band).
 
     Three bands, all in the same unit so one axis carries them:
 
-      top    the `top` widest levels. cut=16 is the scheduler's threshold, but it is a low bar for
-             a kernel that wants thousands of nodes in flight, so the widest few levels are where
-             a warp-per-node design is actually seen at its best.
-      dense  every level of at least `cut` nodes, which is exactly what the hybrid sends to the GPU.
+      top    the `top` widest levels. `cut` is a low bar for a kernel that wants thousands of
+             nodes in flight, so the widest few levels are where a warp-per-node design is
+             actually seen at its best.
+      dense  every level of at least `cut` nodes. This is a reporting band, close to but not
+             identical with the scheduler's own threshold (see \HybridCut).
       thin   the rest, which the hybrid sends to the CPU.
     """
     widths = {}
@@ -376,6 +395,82 @@ def kernel_split(levels_csv, data, dataset, cut=16, top=3):
     return out, cells
 
 
+def write_kernel_gcups_csv(levels_csv, data, outdir, dataset, cut=DENSE_CUT, top=3,
+                           name="kernel_gcups.csv"):
+    """Per-band throughput for every version there is data for, as a plain CSV.
+
+    Two kinds of row, told apart by the `source` column, because they are not the same
+    measurement and averaging them would be meaningless:
+
+      nsys_kernel  per-level kernel time from the nsys profile, so the bands (top-N widest,
+                   dense, thin) can be separated. Only the profiled GPU-only versions have it.
+      wall_clock   total cells over total wall time for one alignment. Every measured version
+                   has it, CPU included, but it cannot be split by level and it carries copies,
+                   launches and traceback as well as the kernel, so it is an effective
+                   end-to-end rate rather than kernel throughput.
+    """
+    widths = {}
+    for r in read_csv(levels_csv):
+        if r["dataset"] == dataset:
+            widths[int(r["level"])] = (int(r["width"]), int(r["bases"]))
+
+    m = QUERY_LEN.get(dataset, 149)
+    top_levels = {lvl for lvl, _ in sorted(widths.items(), key=lambda kv: -kv[1][0])[:top]}
+    bands = [
+        (f"top{top}", lambda lvl, w: lvl in top_levels),
+        (f"dense_ge{cut}", lambda lvl, w: w >= cut),
+        (f"thin_lt{cut}", lambda lvl, w: w < cut),
+    ]
+
+    out = []
+    for machine, d in sorted(data.items()):
+        # --- per-level kernel time, split into bands -------------------------------------------
+        acc = defaultdict(lambda: defaultdict(lambda: [0.0, 0, 0]))  # label -> band -> [s, lv, b]
+        for r in d.get("levels", []):
+            if r["dataset"] != dataset or r.get("mode") != "1":
+                continue
+            lvl, ms = int(r["level"]), float(r["ms"])
+            if lvl not in widths or ms <= 0:
+                continue
+            w, b = widths[lvl]
+            for band, keep in bands:
+                if keep(lvl, w):
+                    a = acc[r.get("label", "")][band]
+                    a[0] += ms * 1e-3
+                    a[1] += 1
+                    a[2] += b
+        for label in sorted(acc):
+            for band, _ in bands:
+                secs, nlv, base = acc[label][band]
+                if secs <= 0:
+                    continue
+                cells = base * m
+                out.append((machine, dataset, label, band, "nsys_kernel",
+                            nlv, f"{cells / 1e9:.4f}", f"{secs * 1e3:.4f}",
+                            f"{cells / secs / 1e9:.2f}"))
+
+        # --- whole-graph rate from wall time, for everything else ------------------------------
+        rows = [r for r in d.get("timings", []) if r["dataset"] == dataset]
+        tot_bases = sum(b for _, b in widths.values())
+        cells = tot_bases * m
+        for label in sorted({r["label"] for r in rows}):
+            st = stats(rows, key=lambda r, l=label: r["label"] == l)
+            if not st or st[0] <= 0 or not cells:
+                continue
+            out.append((machine, dataset, label, "whole_graph", "wall_clock",
+                        len(widths), f"{cells / 1e9:.4f}", f"{st[0] * 1e3:.4f}",
+                        f"{cells / st[0] / 1e9:.2f}"))
+
+    path = os.path.join(outdir, name)
+    with open(path, "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["machine", "dataset", "version", "band", "source",
+                     "levels", "gcells", "ms", "gcups"])
+        wr.writerows(out)
+    print(f"  wrote {path}  ({len(out)} rows)")
+    return path
+
+
 def cpu_baseline_gcups(data, machine, levels_csv, dataset):
     """The CPU last-column version's throughput over the whole graph, as the reference line.
 
@@ -391,7 +486,7 @@ def cpu_baseline_gcups(data, machine, levels_csv, dataset):
     return total / st[0] / 1e9 if (st and total) else None
 
 
-def fig_kernels(levels_csv, data, outdir, dataset, cut=16, top=3, width=TEXT_W):
+def fig_kernels(levels_csv, data, outdir, dataset, cut=DENSE_CUT, top=3, width=TEXT_W):
     """Each GPU version's throughput on the widest few levels, on all dense levels, and on the
     thin ones, with the CPU last-column version as a reference line.
 
@@ -402,6 +497,13 @@ def fig_kernels(levels_csv, data, outdir, dataset, cut=16, top=3, width=TEXT_W):
     if not per_machine:
         print(f"  no per level data for {dataset}, skipping fig_kernels", file=sys.stderr)
         return
+
+    vnum = version_numbers(data)
+
+    def tick_label(lab, vn):
+        v = vn.get(lab)
+        short = KERNEL_SHORT.get(lab, lab)
+        return f"{v} {short}" if v else short
 
     machines = sorted(per_machine)
     labels = [l for l in KERNEL_ORDER if any(l in per_machine[m] for m in machines)]
@@ -432,7 +534,7 @@ def fig_kernels(levels_csv, data, outdir, dataset, cut=16, top=3, width=TEXT_W):
                        label="CPU last_col, whole graph")
 
         ax.set_yticks(y)
-        ax.set_yticklabels([KERNEL_SHORT.get(l, l) for l in labels], color=INK2)
+        ax.set_yticklabels([tick_label(l, vnum) for l in labels], color=INK2)
         ax.set_ylim(len(labels) - 0.5, -0.5)
         ax.set_xscale("log")
         ax.set_xlim(lo / 3.0, hi * 3.0)
@@ -602,6 +704,200 @@ def table_hga(data, outdir, dataset):
     print(f"  wrote {path}")
 
 
+def table_runtime(data, outdir, dataset, part, name):
+    """The runtime ladder as a tabular: versions down the page, machines across it.
+
+    The same numbers fig_runtime draws, but a bar chart of sixteen versions needs the full text
+    width and most of a page height, while this shape fits one column. Grouped by mode, ordered
+    within a mode as the versions were written, best per machine in bold."""
+    machines = [m for m in sorted(data) if data[m].get("timings")]
+    if not machines:
+        return
+
+    order, seen = [], set()
+    for m in machines:
+        for r in data[m]["timings"]:
+            if r["dataset"] != dataset or part_of(r) != part:
+                continue
+            key = (r["label"], r["group"])
+            if key not in seen:
+                seen.add(key)
+                order.append(key)
+    if not order:
+        print(f"  no '{part}' rows for {dataset}, skipping {name}", file=sys.stderr)
+        return
+
+    vnum = version_numbers(data)
+    rank = {g: i for i, g in enumerate(("cpu", "gpu", "fair", "hybrid", "nocopy"))}
+    seen_at = {kv: i for i, kv in enumerate(order)}
+    order.sort(key=lambda kv: (rank.get(kv[1], len(rank)), seen_at[kv]))
+
+    vals = {}
+    for m in machines:
+        rows = [r for r in data[m]["timings"] if r["dataset"] == dataset]
+        for label, _ in order:
+            st = stats(rows, key=lambda r, l=label: r["label"] == l)
+            if st:
+                vals[(m, label)] = st[0] * 1e3
+
+    best = {m: min((v for (mm, _), v in vals.items() if mm == m), default=None)
+            for m in machines}
+
+    lines = ["% Generated by tools/report_figs.py - do not edit, re-run the script.",
+             "\\begin{tabular}{ll" + "r" * len(machines) + "}",
+             "\\hline",
+             "& Version & "
+             + " & ".join((data[m].get("info") or {}).get("gpu", m).replace("NVIDIA ", "")
+                          for m in machines) + " \\\\",
+             "\\hline"]
+
+    prev_group = None
+    for label, group in order:
+        cells = []
+        for m in machines:
+            v = vals.get((m, label))
+            if v is None:
+                cells.append("--")
+            else:
+                txt = f"{v:.0f}" if v >= 100 else f"{v:.1f}"
+                cells.append(f"\\textbf{{{txt}}}" if best[m] and abs(v - best[m]) < 1e-9 else txt)
+        head = GROUP_NAME.get(group, group) if group != prev_group else ""
+        prev_group = group
+        short = label.split("_", 1)[1] if "_" in label else label
+        # Prefix the version number the prose cites. Numbering restarts per mode, so the
+        # gaps (CPU v2, GPU v1 and v6) are real and match the text, which skips them too.
+        if vnum.get(label):
+            short = f"{vnum[label]} {short}"
+        lines.append(f"{head} & \\texttt{{{short.replace('_', chr(92) + '_')}}} & "
+                     + " & ".join(cells) + " \\\\")
+
+    lines += ["\\hline", "\\end{tabular}"]
+
+    path = os.path.join(outdir, name + ".tex")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  wrote {path}")
+
+
+# -------------------------------------------------------------------------------------------------
+#                        Appendix: one table per mode
+# -------------------------------------------------------------------------------------------------
+
+MODE_TABLE = [
+    (0, "cpu",    "table_cpu"),
+    (1, "gpu",    "table_gpu"),
+    (2, "hybrid", "table_hybrid"),
+    (3, "nocopy", "table_nocopy"),
+]
+
+DATASET_SHORT = {"150_10": "150\\_10", "brca2_150": "BRCA2, 150\\,bp",
+                 "brca2_1500": "BRCA2, 1500\\,bp", "150_10_small": "150\\_10 small"}
+
+
+def appendix_tables(data, outdir, datasets=None):
+    """One tabular per mode: rows are (dataset, system), columns are version numbers.
+
+    Version numbers rather than names in the header, because ten named columns do not fit across a
+    page and the numbers are what the argument list of bin/main takes anyway. The best entry in
+    each row is bold. Emitted as bare tabulars so the appendix can wrap them with its own captions
+    and labels, the same way table_hga is used."""
+    machines = [m for m in sorted(data) if data[m].get("timings")]
+    if not machines:
+        return
+
+    seen_ds = []
+    for m in machines:
+        for r in data[m]["timings"]:
+            if r["dataset"] not in seen_ds:
+                seen_ds.append(r["dataset"])
+    order_ds = [d for d in (datasets or seen_ds) if d in seen_ds]
+
+    for mode, group, name in MODE_TABLE:
+        versions, cells = [], {}
+        for machine in machines:
+            for r in data[machine]["timings"]:
+                if int(r["mode"]) != mode or int(r["iter"]) < 0:
+                    continue
+                v = int(r["version"])
+                if v not in versions:
+                    versions.append(v)
+                cells.setdefault((machine, r["dataset"], v), []).append(float(r["time_s"]))
+        if not versions:
+            continue
+        versions.sort()
+
+        lines = ["% Generated by tools/report_figs.py - do not edit, re-run the script.",
+                 "\\begin{tabular}{ll" + "r" * len(versions) + "}",
+                 "\\hline",
+                 "Dataset & System & " + " & ".join(f"v{v}" for v in versions) + " \\\\",
+                 "\\hline"]
+
+        for ds in order_ds:
+            first = True
+            for machine in machines:
+                row = {v: sum(x) / len(x) * 1e3
+                       for v in versions if (machine, ds, v) in cells
+                       for x in [cells[(machine, ds, v)]]}
+                if not row:
+                    continue
+                best = min(row, key=row.get)
+                out = []
+                for v in versions:
+                    if v not in row:
+                        out.append("--")
+                    else:
+                        txt = f"{row[v]:.0f}" if row[v] >= 100 else f"{row[v]:.1f}"
+                        out.append(f"\\textbf{{{txt}}}" if v == best else txt)
+                gpu = (data[machine].get("info") or {}).get("gpu", machine)
+                lines.append((DATASET_SHORT.get(ds, ds) if first else "") + " & " + gpu
+                             + " & " + " & ".join(out) + " \\\\")
+                first = False
+            lines.append("\\hline")
+
+        lines.append("\\end{tabular}")
+
+        path = os.path.join(outdir, name + ".tex")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  wrote {path}")
+
+    # Mode 4, which is per read rather than per alignment and so needs its own shape.
+    rows_any = [r for m in machines for r in data[m].get("batch", [])]
+    if rows_any:
+        sizes = sorted({int(r["num_reads"]) for r in rows_any})
+        lines = ["% Generated by tools/report_figs.py - do not edit, re-run the script.",
+                 "\\begin{tabular}{ll" + "r" * len(sizes) + "}",
+                 "\\hline",
+                 "Dataset & System & "
+                 + " & ".join(f"{r:,}".replace(",", "\\,") for r in sizes) + " \\\\",
+                 "\\hline"]
+        for ds in order_ds:
+            first = True
+            for machine in machines:
+                row = {int(r["num_reads"]): float(r["per_read_ms"])
+                       for r in data[machine].get("batch", []) if r["dataset"] == ds}
+                if not row:
+                    continue
+                best = min(row, key=row.get)
+                out = []
+                for r in sizes:
+                    if r not in row:
+                        out.append("--")
+                    else:
+                        txt = f"{row[r]:.1f}"
+                        out.append(f"\\textbf{{{txt}}}" if r == best else txt)
+                gpu = (data[machine].get("info") or {}).get("gpu", machine)
+                lines.append((DATASET_SHORT.get(ds, ds) if first else "") + " & " + gpu
+                             + " & " + " & ".join(out) + " \\\\")
+                first = False
+            lines.append("\\hline")
+        lines.append("\\end{tabular}")
+        path = os.path.join(outdir, "table_batch.tex")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  wrote {path}")
+
+
 # -------------------------------------------------------------------------------------------------
 #                        numbers.tex
 # -------------------------------------------------------------------------------------------------
@@ -672,6 +968,7 @@ def write_numbers(data, levels_csv, outdir, dataset):
              ""]
     defined = set()
 
+
     def define(name, value):
         if name in defined:
             print(f"  name clash on \\{name}, skipped (fix the tag map)", file=sys.stderr)
@@ -691,7 +988,7 @@ def write_numbers(data, levels_csv, outdir, dataset):
 
     for ds, pts in by_ds.items():
         tag = dataset_tag(ds)
-        wide = [(w, b) for w, b in pts if w >= 16]
+        wide = [(w, b) for w, b in pts if w >= DENSE_CUT]
         total_bases = sum(b for _, b in pts)
         define(f"G{tag}Nodes", f"{sum(w for w, _ in pts):,}".replace(",", "\\,"))
         define(f"G{tag}Levels", f"{len(pts):,}".replace(",", "\\,"))
@@ -706,12 +1003,15 @@ def write_numbers(data, levels_csv, outdir, dataset):
         # A level still costs its longest node even with a thread per node, so this is the ceiling
         # on parallelising the tail the CPU is given.
         thin_rows = [r for r in rows
-                     if r["dataset"] == ds and int(r["width"]) < 16 and r.get("maxlen")]
+                     if r["dataset"] == ds and int(r["width"]) < DENSE_CUT
+                     and r.get("maxlen")]
         thin_work = sum(int(r["bases"]) for r in thin_rows)
         thin_path = sum(int(r["maxlen"]) for r in thin_rows)
         if thin_path and thin_work:
             define(f"G{tag}TailPathPct", f"{100.0 * thin_path / thin_work:.0f}")
             define(f"G{tag}TailMaxGain", f"{thin_work / thin_path:.2f}")
+
+    define("DenseCut", str(DENSE_CUT))
 
     lines.append("")
 
@@ -792,6 +1092,42 @@ def write_numbers(data, levels_csv, outdir, dataset):
             gains = [100.0 * (b - a) / b for a, b in nc]
             define(f"{mt}NocopyGainPct", f"{sum(gains) / len(gains):.0f}")
 
+        # The matrix-era no-copy versions, where the copies removed are whole score matrices
+        # rather than single columns, so the shared graph has something substantial to save.
+        for nc_lab, gpu_lab, tag in (("nocopy_naive", "gpu_naive", "Naive"),
+                                     ("nocopy_level", "gpu_parallel_node", "Level"),
+                                     ("nocopy_shared_mem", "gpu_shared_mem", "SharedMem")):
+            a, b = ms_of(nc_lab), ms_of(gpu_lab)
+            if a and b:
+                define(f"{mt}NocopyGain{tag}", f"{b / a:.2f}")
+
+        # Which memory strategy the matrix-era hybrid wants, which is the whole point of having
+        # written four of them.
+        hyb = {t: ms_of(f"hybrid_{l}") for t, l in
+               (("Base", "base"), ("Unified", "unified"), ("Pinned", "pinned"),
+                ("Advised", "advised"))}
+        hyb = {t: v for t, v in hyb.items() if v}
+        if len(hyb) > 1:
+            bt = min(hyb, key=hyb.get)
+            wt = max(hyb, key=hyb.get)
+            define(f"{mt}MatrixHybridBestName", bt.lower())
+            define(f"{mt}MatrixHybridBest", f"{hyb[bt]:.0f}")
+            define(f"{mt}MatrixHybridWorstName", wt.lower())
+            define(f"{mt}MatrixHybridWorst", f"{hyb[wt]:.0f}")
+            define(f"{mt}MatrixHybridSpread", f"{hyb[wt] / hyb[bt]:.1f}")
+
+            # v2 (pinned) against v3 (managed + advise) is the only pair that differs in the
+            # memory kind alone -- both share the same scheduler -- so it is the only clean
+            # read of what the memory strategy costs. Signed: positive means pinned is worse.
+            if "Pinned" in hyb and "Advised" in hyb:
+                define(f"{mt}PinnedOverAdvisedPct",
+                       f"{100.0 * (hyb['Pinned'] - hyb['Advised']) / hyb['Advised']:.0f}")
+
+            # Does the best matrix-era hybrid beat the parallel CPU it has to justify itself
+            # against? >1 means the hybrid wins. The two machines answer differently.
+            if pnode:
+                define(f"{mt}MatrixHybridVsCpu", f"{pnode / hyb[bt]:.2f}")
+
         # What is left for further kernel work once the CPU tail is fixed: Amdahl on the split.
         ph_all = [r for r in d.get("phases", []) if r["dataset"] == dataset]
         if ph_all:
@@ -818,6 +1154,29 @@ def write_numbers(data, levels_csv, outdir, dataset):
             define(f"{mt}HybCpuPct", f"{100.0 * cpu_ms / max(gpu_ms + cpu_ms, 1e-9):.0f}")
             define(f"{mt}HybGpuLevels", str(int(float(ph[0]["gpu_levels"]))))
             define(f"{mt}HybCpuLevels", f"{int(float(ph[0]['cpu_levels'])):,}".replace(",", "\\,"))
+
+            # The scheduler's HYBRID_MIN_NODES is a compile-time constant that never reaches a
+            # CSV, but it is recoverable: it is the widest threshold that still sends exactly
+            # gpu_levels levels to the GPU. Deriving it means the prose cannot quote a threshold
+            # the binary was not actually built with.
+            n_gpu = int(float(ph[0]["gpu_levels"]))
+            widths = sorted((w for w, _ in level_width.values()), reverse=True)
+            cand = [w for w in range(1, 1025)
+                    if sum(1 for x in widths if x >= w) == n_gpu]
+            if cand:
+                hcut = max(cand)
+                define(f"{mt}HybridCut", str(hcut))
+                # The dense band reported below starts at DENSE_CUT, the scheduler switches at
+                # hcut. Quantify the disagreement so the prose can say the two read the same
+                # instead of asserting it: the bases in levels the scheduler gives the GPU but
+                # the reported band excludes.
+                gap = sum(b for w, b in level_width.values() if hcut <= w < DENSE_CUT)
+                tot_b = sum(b for _, b in level_width.values())
+                define(f"{mt}CutGapPct", f"{100.0 * gap / max(tot_b, 1):.1f}")
+                # And what widening the threshold could ever hand back to the CPU: everything
+                # between the current cut and a very wide one.
+                band = sum(b for w, b in level_width.values() if hcut <= w < 512)
+                define(f"{mt}CutBandPct", f"{100.0 * band / max(tot_b, 1):.1f}")
 
         # The GPU's best on the dense levels against the CPU's best anywhere. Two peaks, which is
         # the honest way to say how much the GPU is worth where it has room to work.
@@ -855,7 +1214,7 @@ def write_numbers(data, levels_csv, outdir, dataset):
                 continue
             w, b = level_width[lvl]
             slot = acc[r.get("label", "")]
-            if w >= 16:
+            if w >= DENSE_CUT:
                 slot[0] += b * QUERY_LEN.get(dataset, 149)
                 slot[1] += float(r["ms"]) * 1e-3
             else:
@@ -981,6 +1340,10 @@ def main():
     fig_runtime(data, args.outdir, args.dataset, part="lastcol",
                 name="fig_runtime_lastcol")
     table_hga(data, args.outdir, args.hga_dataset)
+    table_runtime(data, args.outdir, args.dataset, "matrix", "table_runtime_matrix")
+    table_runtime(data, args.outdir, args.dataset, "lastcol", "table_runtime_lastcol")
+    write_kernel_gcups_csv(levels_csv, data, args.outdir, args.dataset)
+    appendix_tables(data, args.outdir)
     write_numbers(data, levels_csv, args.outdir, args.dataset)
 
 

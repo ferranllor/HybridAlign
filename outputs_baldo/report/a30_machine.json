@@ -1,0 +1,9 @@
+{
+  "host": "edu01",
+  "arch": "x86_64",
+  "gpu": "NVIDIA A30",
+  "sms": 0,
+  "cpu": "Intel(R) Xeon(R) Silver 4309Y CPU @ 2.80GHz",
+  "cores": 32,
+  "machine": "a30"
+}
