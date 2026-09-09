@@ -36,7 +36,7 @@ int warps_elems_per_warp(int max_node_size, int M, int band_width) {
 //
 // *************************************************************************************************
 
-// I mean it's the same thing, but now I have WARPS_PER_BLOCK warps per block, so I have to change how I launch the kernels a bit. I also added some extra args
+// I mean, it's the same thing, but now I have WARPS_PER_BLOCK warps per block, so I have to change how I launch the kernels a bit. I also added some extra args
 // to the kernel call. Honestly, it was laziness, but if you need those bytes, you can calculate it on inside the kernel intead. 
 // Look at the kernel comment though, way more explanatory
 
@@ -191,15 +191,15 @@ AlignmentResult gpu_align_warps(Graph graph, Graph cudaGraph, Sequence sequence)
 //
 // You may already see coming a first problem, each node is different in size, and so, what if a warp finishes earlier? Does it wait
 // and do nothing until the slowest one finishes? Well, yes, and no. Remember the topological sort? Well, as a second key, I used the length
-// of the sequence of the node, so, since warps have roughly the same amount of work, they should take the same amount of time (roughly).
+// of the sequence of the node, so, since warps are handed consecutive nodes, they have roughly the same amount of work, and they should take the same amount of time (roughly).
 // And now I see you saying: But, what if one warp gets the columns it needs earlier? Or what if the number of warps is more than the GPU can do in parallel?
-// And to that I say, I know, I just don't know how to fix it :'). For now, just use a number of warps multiple of 4, since GPUs tent to have 4 warp schedulers
-// with its associated resources in there, also, using many more than 4 would net be good for now, it's not like I have that much work on the dataset.
+// And to that I say, I know, I just don't know how to fix it :'). For now, just use a number of warps multiple of 4, since GPUs tend to have 4 warp schedulers
+// with its associated resources in there, also, using many more than 4 would not be good for now, it's not like I have that much work on the dataset.
 // 
 // Now, onto how it works. This is pretty much the shared mem version, but using warps and syncwarp instead of syncthreads (for the most part) and thread 0 is now lane 0.
 // What actually changed a bit is the last bit of the reduction, given that we have warps, now it's a shuffle reduction, courtesy of claude.
 //
-// Last note, I forgot to mention this is slower for GPU only. This is because before we had 160 threads working on a node, and now we have 32, even if individually faster.
+// Last note, I forgot to mention this is slower for GPU only. This is because before we had 160 threads working on a node, and now we have 32, even if faster when there's many.
 // On the long tail of 1-4 ndoes per level of my datasets, that means the last part is slower than a pentium would be if it did it. (not really, but you get the point)
 // In any case, hybrid versions rock for this, specially since I realised that I was compiling them without optimisations flags, and now they are FAST by comparison.
 

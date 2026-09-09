@@ -164,12 +164,42 @@ AlignmentResult gpu_align_last_col(Graph graph, Graph cudaGraph, Sequence sequen
 // So I had a good idea. I remembered something that I overheard a while back, it basically was about recomputing
 // the dp matrix during the traceback. I though it didn't make any sense, you need the dp matrices of each node/vertex's
 // predecessor to be able to compute its dp matrix, and then I realised, I don't need the entire thing, only the last column!
+//
+// Basically, I realised every DP matrix is defined entirely by the elements of the last column from every predesecor node, so, this means
+// that if we only store those, we can recompute the DP matriceas later without storing much data.
+//
+// The second interesting thing, is that, during the traceback phase, to decide to which predecesor node we will go from from the current
+// node, we only need the elements of the last column!
+//
+//
+//  +------------+
+//  |          A1|
+//  |          A2|  <---+
+//  |          A3|  <---+
+//  |          A4|      |       +------------+
+//  +------------+      |       | C1         |
+//                      |       | C2         |
+//                      +------ | C3         | (optimal alignment goes through cell C3, and it looks at the cell on top C2, and cells max(A2, B2) & max(A3, B3))
+//  +------------+      |       | C4         |
+//  |          B1|      |       +------------+
+//  |          B2|  <---+
+//  |          B3|  <---+
+//  |          B4|
+//  +------------+
+//
+//
+// With this, since the optimal alignment normally goes through a small percentage of the total nodes, we can just save those and recompute the DP matrices 
+// where the alignment happens on the way back in the CPU. Since the percentage is small, even if the CPU can deliver less throughput, this barely accounts for <1% of exec time.
+//
+// However, worth noting this is not so true on real pangenome graphs, where the branching factor is small. It's why I made optimised kernels that
+// move the DP matrix arround, and why systems like the DGX Spark is useful in the field, since the GPU can compute those much faster.
+// This does not mean it's useless however, if, for example, you wanted to align a short sequence to a massive graph, you will compute a DP matrix for every node,
+// but you know 99% of them will not be looked at. As with most things in life, wether this helps depends on the situation (or in this case, the dataset)
+//
 // So, big version here, I went from using 7,8GB of VRAM to align one sequence to a graph, and now this version only uses 30 MB
 // This is great, it completly makes this compute bound, but, it kind of makes all the previous work obsolete, given I don't have
 // to move data at all now :'). In any case, it's basically the same thing as the shared memory kernel that claude helped me
-// fix, and this time it ONLY uses shared memory (aside from the reads of the previous cols of previous nodes at the start).
-// 
-// Maybe you're expecting a drawing, but I'm really looking forward to ending this, so you'll have to read code, srry ;P
+// fix, and this time it ONLY uses shared memory (aside from the reads of the previous cols of previous nodes at the start,a nd storing those last columns, of course).
 
 __global__ void compute_dp_gpu_last_col(Node* node, Sequence sequence, Sequence sequence_rev)
 {

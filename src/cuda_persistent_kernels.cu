@@ -6,6 +6,9 @@
 
 #include <sched.h>
 
+// I didn't mention this version because it was a failed experiment, I could not get it to perform well 
+// in the time I had, so it's more of a leftover than anything...
+
 // The persistent workers on the registers core. A worker used to be a thread block of band_width
 // threads filling a whole dp matrix; it is a warp now, doing one node with the three diagonals in
 // registers and leaving only its last column behind. So a block of WARPS_PER_BLOCK warps is

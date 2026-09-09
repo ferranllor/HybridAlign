@@ -33,7 +33,8 @@ int registers_merged_req_elems_per_warp(int max_node_size, int M) {
 
 // This version is rather simple, remember how we had to, at every diagonal, get one singular halo value? It was driving the 
 // LSU units mad, so much so they were the bottleneck. I added this merged_req version, which just modified the kernel to request and store those halo
-// elements 32 at a time, which is much easier on the LSUs.
+// elements 32 at a time, which is much easier on the LSUs. The thing is that this kernel now went from 50-ish registers -> 70-ish registers.
+// This is now a problem because it lowers occupancy, so we'll have to see how to work on that... 
 
 __global__ void compute_dp_gpu_registers_merged_req(Node* nodes, int level_nodes, Sequence sequence,
                                                 Sequence sequence_rev, int elems_per_warp, int toprow_slots)

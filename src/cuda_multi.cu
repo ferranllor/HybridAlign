@@ -306,7 +306,7 @@ __global__ void compute_dp_gpu_multi(Node* nodes, int level_nodes, int num_reads
 // is also the correctness check, its alignment has to come out the same as every single sequence
 // version produces.
 // 
-// This was done by claude, just generates some dummy sequences for my small dataset so we acn du multi sequence
+// This was done by claude, just generates some dummy sequences for my small dataset so we can do multi sequence without exlicitly having N sequences in the input file
 
 void multi_build_reads(Sequence sequence, int num_reads, DTYPEALPHABET* reads, DTYPEALPHABET* reads_rev)
 {

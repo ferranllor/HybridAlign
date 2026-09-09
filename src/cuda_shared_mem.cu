@@ -138,8 +138,9 @@ AlignmentResult gpu_align_shared_mem(Graph graph, Graph cudaGraph, Sequence sequ
 
     return compute_traceback_gpu_shared_mem(graph, sequence);
 }
-// The kernel is now a thin wrapper: one block per node of the level, and the DP itself lives in
-// cuda_dp_shared_mem.cuh so the persistent kernel version can call the very same code.
+
+// For this version, the kernel is on cuda_dp_shared_mem in the include file. The reason for this is that I use the same kernel on the persistent kernel ver.
+// Having it on a .cuh makes that easier
 __global__ void compute_dp_gpu_shared_mem(Node* node, Sequence sequence, Sequence sequence_rev)
 {
     compute_dp_node_shared_mem(&node[blockIdx.x], sequence, sequence_rev);
